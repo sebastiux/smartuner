@@ -10,3 +10,6 @@ cache/*
 results/*
 !results/.gitkeep
 data/synthetic/*.wav
+
+# Worktrees temporales de herramientas de desarrollo
+.claude/
