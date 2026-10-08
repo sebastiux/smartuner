@@ -1,0 +1,7 @@
+# Dependencias opcionales.
+# Reproducción de audio desde la GUI (requiere PortAudio en el sistema):
+sounddevice>=0.4.6
+# Separación de fuentes (checkbox "Separar bajo de mezcla"); instala PyTorch (pesado):
+demucs>=4.0.1
+# Además, para el dataset sintético con sonido realista: fluidsynth + un soundfont GM
+# (p. ej. FluidR3_GM.sf2). Sin ellos se usa un sintetizador Karplus-Strong integrado.

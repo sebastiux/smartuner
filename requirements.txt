@@ -1,0 +1,9 @@
+# Dependencias principales (Python 3.11+).
+# Requiere además ffmpeg instalado en el sistema (decodificación/codificación MP3).
+numpy>=1.26
+scipy>=1.11
+librosa>=0.10.2
+soundfile>=0.12
+matplotlib>=3.8
+pretty_midi>=0.2.10
+pytest>=8.0

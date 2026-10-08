@@ -1,0 +1,12 @@
+# Entornos y cachés de Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Artefactos generados (se regeneran desde la GUI o la CLI)
+cache/*
+!cache/.gitkeep
+results/*
+!results/.gitkeep
+data/synthetic/*.wav
