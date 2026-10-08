@@ -25,6 +25,10 @@ Contenido::
     │ (c) Recompensa por pull   │ (d) Criterio de decisión   │ Registro de decisiones (un PullEvent por línea)  │
     └ leyenda común                                          │ ¿Qué muestra el panel (d)?                       ┘
 
+Con la ventana estrecha (1024 px) la primera fila se parte en dos (semilla y
+traste previo debajo), los títulos usan su versión corta, las etiquetas de
+los brazos se giran y la leyenda usa menos columnas: nada queda cortado.
+
 Semilla y reproducibilidad
 --------------------------
 La semilla de la pestaña sustituye a ``cfg.experiment.seed`` en la copia de la
@@ -76,17 +80,20 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from matplotlib.artist import Artist
+from matplotlib.axes import Axes
 from matplotlib.backend_bases import DrawEvent, ResizeEvent
 from matplotlib.figure import Figure
+from matplotlib.font_manager import FontProperties
 from matplotlib.layout_engine import ConstrainedLayoutEngine
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch, Rectangle
+from matplotlib.text import Text
 from matplotlib.ticker import FixedLocator, MaxNLocator
 
-from gui.widgets import PlotFrame, Tooltip, show_error
+from gui.widgets import PlotFrame, Tooltip
 from src import plots
 from src.config import ALGO_COLORS, ALGO_LABELS, ALGORITHMS, PARAM_SPECS, Config
-from src.experiments import SEGMENT_DATA_ENV_PARAMS, LiveSession, PullEvent
+from src.experiments import ALGO_SHORT, SEGMENT_DATA_ENV_PARAMS, LiveSession, PullEvent
 from src.pitch import hz_to_midi, midi_to_name
 
 if TYPE_CHECKING:  # solo para anotaciones (evita importes circulares)
@@ -111,6 +118,9 @@ DEFAULT_SPEED = 20
 
 #: Intervalo mínimo entre redibujados del modo automático (ms): 40 ms = 25 fps.
 FRAME_MS = 40
+
+#: Pausa mínima (ms) entre el final de un tick y el siguiente (Tk atiende eventos y dibujados).
+MIN_TICK_GAP_MS = 5
 
 #: Tiempo máximo (s) que se «recupera» en un tick si el anterior se retrasó
 #: (p. ej. por un dibujado completo): evita ráfagas enormes de pulls.
@@ -141,6 +151,23 @@ HIGHLIGHT_LW = 2.0
 #: Rayado de los brazos sin probar en el índice UCB (+∞).
 UNTRIED_HATCH = "////"
 
+#: Títulos de los paneles fijos: versión normal y corta (paneles estrechos).
+PANEL_TITLES: dict[str, tuple[str, str]] = {
+    "a": ("(a) Q estimado por brazo vs. μ real", "(a) Q estimado vs. μ real"),
+    "b": ("(b) Pulls por brazo", "(b) Pulls por brazo"),
+    "c": ("(c) Recompensa por pull", "(c) Recompensa por pull"),
+}
+
+#: Tamaño (pt) de los textos de la leyenda común y del título de la figura.
+LEGEND_FONT_SIZE = 8.5
+SUPTITLE_SIZE = 11.5
+
+#: Opciones de la leyenda común (en unidades de tamaño de fuente, como en matplotlib).
+LEGEND_OPTS: dict[str, float] = {"handlelength": 2.0, "handletextpad": 0.8, "columnspacing": 1.4, "borderpad": 0.4}
+
+#: Máximo de columnas de la leyenda común (con la ventana ancha cabe en dos filas).
+LEGEND_MAX_COLS = 5
+
 #: Escalones «redondos» (mantisas) para los límites de los ejes dinámicos:
 #: así la escala cambia pocas veces y casi todos los ticks se pintan con *blitting*.
 COUNT_MANTISSAS: tuple[float, ...] = (1.0, 2.0, 5.0, 10.0)
@@ -155,7 +182,7 @@ LATEST_BG = "#e8f0fb"
 
 #: Texto corto de cada tipo de decisión (``Decision.kind``).
 KIND_TEXT: dict[str, str] = {
-    "init": "pull inicial obligatorio",
+    "init": "pull inicial",
     "explore": "explora",
     "exploit": "explota",
     "sample": "muestreo de π",
@@ -461,7 +488,7 @@ def value_limits(r_min: float, r_max: float, q0: float) -> tuple[float, float]:
     return (lo - pad if lo < 0 else 0.0), hi + pad
 
 
-def criterion_title(algorithm: str, agent: BanditAgent) -> str:
+def criterion_title(algorithm: str, agent: BanditAgent, compact: bool = False) -> str:
     """Título del panel (d) con el hiperparámetro VIGENTE (ε o τ pueden decaer con t).
 
     Parameters
@@ -470,20 +497,35 @@ def criterion_title(algorithm: str, agent: BanditAgent) -> str:
         Identificador del algoritmo.
     agent : BanditAgent
         Agente en ejecución (se leen ``epsilon``, ``q0``, ``c`` o ``tau``).
+    compact : bool, optional
+        Versión corta (sin la fórmula) para paneles estrechos (ventana de 1024 px).
 
     Returns
     -------
     str
-        P. ej. ``"(d) Criterio: Q estimado (ε = 0.10)"``.
+        P. ej. ``"(d) Criterio: Q estimado   (ε = 0.1)"``.
+
+    Examples
+    --------
+    >>> from src.agents import UCB1Agent
+    >>> criterion_title("ucb1", UCB1Agent(n_arms=3, c=1.414))
+    '(d) Índice UCB = Q + c·√(ln t / n)   (c = 1.41)'
+    >>> criterion_title("ucb1", UCB1Agent(n_arms=3, c=1.414), compact=True)
+    '(d) Índice UCB   (c = 1.41)'
     """
     if algorithm == "ucb1":
-        return f"(d) Índice UCB = Q + c·√(ln t / n)   (c = {getattr(agent, 'c', 0.0):.2f})"
+        c = float(getattr(agent, "c", 0.0))
+        return f"(d) Índice UCB   (c = {c:.2f})" if compact else f"(d) Índice UCB = Q + c·√(ln t / n)   (c = {c:.2f})"
     if algorithm == "softmax":
-        return f"(d) Probabilidad de elegir cada brazo π(a)   (τ = {getattr(agent, 'tau', 0.0):.3g})"
+        tau = float(getattr(agent, "tau", 0.0))
+        return f"(d) Probabilidad π(a)   (τ = {tau:.3g})" if compact else \
+            f"(d) Probabilidad π(a) de cada brazo   (τ = {tau:.3g})"
     eps = float(getattr(agent, "epsilon", 0.0))
     if algorithm == "optimistic":
+        if compact:
+            return f"(d) Q estimado   (ε = {eps:.2g}, Q₀ = {agent.q0:g})"
         return f"(d) Criterio: Q estimado, greedy   (ε = {eps:.2g}, Q₀ = {agent.q0:g})"
-    return f"(d) Criterio: Q estimado   (ε = {eps:.3g})"
+    return f"(d) Q estimado   (ε = {eps:.3g})" if compact else f"(d) Criterio: Q estimado   (ε = {eps:.3g})"
 
 
 def criterion_ylabel(algorithm: str) -> str:
@@ -606,6 +648,7 @@ def format_change(key: str, old: Any, new: Any) -> str:
     label = spec.label if spec is not None else key
 
     def fmt(v: Any) -> str:
+        """Valor legible: «vacío», «sí»/«no» o el número sin ceros sobrantes."""
         if v is None:
             return "vacío"
         if isinstance(v, bool):
@@ -615,6 +658,71 @@ def format_change(key: str, old: Any, new: Any) -> str:
         return str(v)
 
     return f"{label} ({fmt(old)} → {fmt(new)})"
+
+
+def legend_columns(label_widths: Sequence[float], available_px: float, font_px: float,
+                   max_cols: int = LEGEND_MAX_COLS) -> int:
+    """Mayor número de columnas (≤ ``max_cols``) con el que la leyenda cabe en ``available_px``.
+
+    Reproduce cómo reparte matplotlib las entradas (``np.array_split``: las
+    primeras columnas reciben una entrada más) y suma, por columna, el ancho
+    de su texto más largo + muestra + separaciones (:data:`LEGEND_OPTS`).
+
+    Parameters
+    ----------
+    label_widths : Sequence[float]
+        Ancho (px) del texto de cada entrada, en orden.
+    available_px : float
+        Ancho disponible (px), normalmente el de la figura.
+    font_px : float
+        Tamaño de la fuente de la leyenda en píxeles.
+    max_cols : int, optional
+        Máximo de columnas.
+
+    Returns
+    -------
+    int
+        Columnas (al menos 1).
+
+    Examples
+    --------
+    >>> legend_columns([100.0] * 8, 1000.0, 12.0), legend_columns([100.0] * 8, 500.0, 12.0)
+    (5, 3)
+    """
+    widths = np.asarray(label_widths, dtype=float)
+    if widths.size == 0:
+        return 1
+    per_entry = (LEGEND_OPTS["handlelength"] + LEGEND_OPTS["handletextpad"]) * font_px
+    for ncol in range(min(max_cols, widths.size), 1, -1):
+        columns = [c for c in np.array_split(widths, ncol) if c.size]
+        total = sum(float(c.max()) + per_entry for c in columns)
+        total += (len(columns) - 1) * LEGEND_OPTS["columnspacing"] * font_px + 2 * LEGEND_OPTS["borderpad"] * font_px
+        if total <= available_px:
+            return ncol
+    return 1
+
+
+def panel_title(ax: Axes, text: str) -> Text:
+    """Pone el título de un panel con el estilo de :mod:`src.plots` y DEVUELVE el texto.
+
+    Es el título de la izquierda (``loc="left"``), como en ``src.plots``; se
+    guarda la referencia para cambiarlo después (el ε o la τ vigentes del
+    panel (d)) sin crear un segundo título encima.
+
+    Parameters
+    ----------
+    ax : Axes
+        Panel.
+    text : str
+        Título.
+
+    Returns
+    -------
+    Text
+        El artista del título.
+    """
+    return ax.set_title(text, loc="left", fontsize=plots.PANEL_TITLE_SIZE, color=plots.TEXT_PRIMARY,
+                        fontweight="bold", pad=6)
 
 
 def arm_tick_labels(data: SegmentBanditData, optimal: Sequence[int]) -> list[str]:
@@ -632,7 +740,7 @@ def arm_tick_labels(data: SegmentBanditData, optimal: Sequence[int]) -> list[str
     list[str]
         Una etiqueta por brazo.
     """
-    best = set(int(i) for i in optimal)
+    best = {int(i) for i in optimal}
     return [arm.label + ("★" if i in best else "") for i, arm in enumerate(data.arms)]
 
 
@@ -670,6 +778,7 @@ class LivePlot:
     """
 
     def __init__(self, figure: Figure) -> None:
+        """Guarda la figura; los ejes y artistas se crean en :meth:`build` (uno por sesión)."""
         self.figure = figure
         self.algorithm = ""
         self.color = plots.TEXT_SECONDARY
@@ -683,14 +792,23 @@ class LivePlot:
         self.q_bars: list[Rectangle] = []
         self.count_bars: list[Rectangle] = []
         self.score_bars: list[Rectangle] = []
+        self.inf_texts: list[Text] = []
         self.mu_markers: Line2D | None = None
         self.points_optimal: Line2D | None = None
         self.points_other: Line2D | None = None
         self.average_line: Line2D | None = None
+        self.titles: dict[str, Text] = {}
+        self.suptitle: Text | None = None
+        self.suptitle_texts: tuple[str, str] = ("", "")
+        self.legend: Any = None
+        self.legend_ncol = LEGEND_MAX_COLS
+        self.compact_d = False
         self.count_top = 0.0
         self.index_top = 0.0
         self.value_lims = (0.0, 1.0)
         self.has_session = False
+        self._agent: BanditAgent | None = None
+        self._handles: list[Artist] = []
 
     # ----------------------------------------------------------- construcción
     def show_message(self, text: str) -> None:
@@ -707,9 +825,10 @@ class LivePlot:
         fig.set_facecolor(plots.SURFACE)
         fig.text(0.5, 0.5, text, ha="center", va="center", color=plots.TEXT_SECONDARY, fontsize=11, wrap=True)
         self.has_session = False
-        self.q_bars, self.count_bars, self.score_bars = [], [], []
+        self.q_bars, self.count_bars, self.score_bars, self.inf_texts = [], [], [], []
+        self.titles, self.suptitle, self.legend, self._agent = {}, None, None, None
 
-    def build(self, session: LiveSession, title: str) -> None:
+    def build(self, session: LiveSession, title: str, short_title: str | None = None) -> None:
         """Crea ejes y artistas para ``session`` (una vez por sesión).
 
         Parameters
@@ -718,6 +837,8 @@ class LivePlot:
             Sesión recién creada (t = 0).
         title : str
             Título de la figura (contexto: algoritmo, segmento, semilla…).
+        short_title : str | None
+            Versión corta del título para figuras estrechas (None = la misma).
         """
         fig = self.figure
         fig.clear()
@@ -727,6 +848,7 @@ class LivePlot:
         self.algorithm = alg
         self.color = ALGO_COLORS.get(alg, plots.TEXT_SECONDARY)
         data, env, agent = session.data, session.env, session.agent
+        self._agent = agent
         k = data.n_arms
         self.n_arms = k
         self.budget = int(session.budget)
@@ -748,7 +870,7 @@ class LivePlot:
                                      color=plots.TEXT_PRIMARY, markeredgecolor=plots.SURFACE,
                                      markeredgewidth=0.8, zorder=4)
         ax.set_ylim(*self.value_lims)
-        plots._panel_title(ax, "(a) Q estimado por brazo vs. μ real")
+        self.titles["a"] = panel_title(ax, PANEL_TITLES["a"][0])
         plots._axis_labels(ax, ylabel="valor (recompensa)")
 
         # (b) Pulls por brazo.
@@ -757,7 +879,7 @@ class LivePlot:
         self.count_top = count_axis_top(0, self.budget)
         ax.set_ylim(0, self.count_top * 1.05)
         ax.yaxis.set_major_locator(MaxNLocator(nbins=5, integer=True))
-        plots._panel_title(ax, "(b) Pulls por brazo")
+        self.titles["b"] = panel_title(ax, PANEL_TITLES["b"][0])
         plots._axis_labels(ax, ylabel="pulls (n)")
 
         # (c) Recompensa por pull: puntos, media móvil y μ*.
@@ -772,7 +894,7 @@ class LivePlot:
         r_lo, r_hi = min(0.0, r_min), r_max
         pad = 0.06 * max(r_hi - r_lo, 0.1)
         ax.set_ylim(r_lo - (pad if r_lo < 0 else 0.0), r_hi + pad)
-        plots._panel_title(ax, "(c) Recompensa por pull")
+        self.titles["c"] = panel_title(ax, PANEL_TITLES["c"][0])
         plots._axis_labels(ax, xlabel="pull t", ylabel="recompensa r")
 
         # (d) Criterio de decisión.
@@ -786,22 +908,46 @@ class LivePlot:
             ax.set_ylim(self.value_lims[0], self.index_top)
         else:
             ax.set_ylim(*self.value_lims)
-        plots._panel_title(ax, criterion_title(alg, agent))
+        # «∞» sobre las barras rayadas de UCB1 (x en datos, y en fracción del eje: no
+        # dependen de la escala). Se muestran solo mientras el brazo no se ha probado.
+        self.inf_texts = []
+        if alg == "ucb1":
+            self.inf_texts = [
+                ax.text(i, 0.985, "∞", transform=ax.get_xaxis_transform(), ha="center", va="top",
+                        fontsize=10, fontweight="bold", color=self.color, zorder=5, visible=False,
+                        bbox={"boxstyle": "round,pad=0.12", "facecolor": plots.SURFACE, "edgecolor": "none"})
+                for i in range(k)
+            ]
+        self.compact_d = False
+        self.titles["d"] = panel_title(ax, criterion_title(alg, agent))
         plots._axis_labels(ax, xlabel="brazo (cuerda-traste)", ylabel=criterion_ylabel(alg))
 
         for bar_ax in (self.ax_q, self.ax_n, self.ax_d):
             bar_ax.set_xlim(-0.6, k - 0.4)
         plots.apply_style(fig, grid="y")
         self.ax_r.grid(True, axis="both", color=plots.GRID, linewidth=plots.GRID_WIDTH)
-        self._set_arm_ticks(arm_tick_labels(data, env.optimal_arms), env.optimal_arms)
-        fig.suptitle(title, x=0.01, ha="left", fontsize=11.5, fontweight="bold", color=plots.TEXT_PRIMARY)
-        plots._legend(fig, self._legend_handles(session), loc="outside lower center", ncol=5,
-                      handlelength=2.0, columnspacing=1.4, fontsize=8.5)
+        self.suptitle_texts = (title, short_title or title)
+        self.suptitle = fig.suptitle(title, x=0.01, ha="left", fontsize=SUPTITLE_SIZE, fontweight="bold",
+                                     color=plots.TEXT_PRIMARY)
+        self._handles = self._legend_handles(session)
+        self.legend = None
+        self._set_arm_ticks(arm_tick_labels(data, env.optimal_arms), env.optimal_arms)   # crea la leyenda
         self.has_session = True
         self.update(session)
 
     def _legend_handles(self, session: LiveSession) -> list[Artist]:
-        """Muestras de la leyenda común (en el orden de los paneles)."""
+        """Muestras de la leyenda común (en el orden de los paneles).
+
+        Parameters
+        ----------
+        session : LiveSession
+            Sesión dibujada (da Q₀ del optimista).
+
+        Returns
+        -------
+        list[Artist]
+            Muestras con su etiqueta (``get_label()``).
+        """
         alg = self.algorithm
         handles: list[Artist] = [
             Patch(facecolor=self.color, edgecolor="none", label=f"{ALGO_LABELS.get(alg, alg)}"),
@@ -816,7 +962,7 @@ class LivePlot:
                                   label=f"Q₀ = {session.agent.q0:g} (barra clara: sin probar)"))
         if alg == "ucb1":
             handles.append(Patch(facecolor=plots.SURFACE, edgecolor=self.color, hatch=UNTRIED_HATCH,
-                                 linewidth=0.8, label="sin probar: índice +∞"))
+                                 linewidth=0.8, label="∞ sin probar: índice +∞"))
         handles += [
             Line2D([], [], linestyle="none", marker="o", markersize=5, color=self.color, markeredgewidth=0,
                    label="r de un pull al óptimo"),
@@ -828,8 +974,16 @@ class LivePlot:
         return handles
 
     def _set_arm_ticks(self, labels: list[str], optimal: Sequence[int]) -> None:
-        """Etiquetas de brazo en los paneles de barras (★ y negrita en los óptimos)."""
-        best = set(int(i) for i in optimal)
+        """Etiquetas de brazo en los paneles de barras (★ y negrita en los óptimos).
+
+        Parameters
+        ----------
+        labels : list[str]
+            Una etiqueta por brazo (ver :func:`arm_tick_labels`).
+        optimal : Sequence[int]
+            Índices de los brazos óptimos.
+        """
+        best = {int(i) for i in optimal}
         x = np.arange(len(labels))
         for ax in (self.ax_q, self.ax_n, self.ax_d):
             ax.set_xticks(x, labels)
@@ -837,17 +991,47 @@ class LivePlot:
                 if i in best:
                     text.set_color(plots.TEXT_PRIMARY)
                     text.set_fontweight("bold")
-        self.apply_tick_layout()
+        self.apply_responsive_layout()
 
-    def apply_tick_layout(self) -> None:
-        """Gira las etiquetas de brazo si no caben horizontales en el ancho actual del panel."""
-        if not self.has_session and not self.q_bars:
+    # ----------------------------------------------------------- adaptación al tamaño
+    def _text_width(self, text: str, size: float, bold: bool = False) -> float:
+        """Ancho (px) que ocupará ``text`` con la fuente de las gráficas.
+
+        Parameters
+        ----------
+        text : str
+            Texto a medir.
+        size : float
+            Tamaño de fuente (pt).
+        bold : bool
+            Negrita.
+
+        Returns
+        -------
+        float
+            Ancho en píxeles de la figura (mide el *renderer* Agg real).
+        """
+        renderer = self.figure.canvas.get_renderer()
+        prop = FontProperties(size=size, weight="bold" if bold else "normal")
+        width, _height, _descent = renderer.get_text_width_height_descent(text, prop, ismath=False)
+        return float(width)
+
+    def apply_responsive_layout(self) -> None:
+        """Adapta textos y leyenda al tamaño ACTUAL de la figura (al crearla y al redimensionar).
+
+        * Etiquetas de brazo: horizontales si caben; si no, giradas 45° o 90°.
+        * Títulos de los paneles y de la figura: versión corta si la larga no cabe.
+        * Leyenda común: tantas columnas como quepan (máx. :data:`LEGEND_MAX_COLS`).
+        """
+        if self.ax_q is None or not self.q_bars:
             return
         fig = self.figure
-        width_px = fig.get_figwidth() * fig.dpi * 0.42           # ancho aproximado de un panel
+        fig_px = float(fig.get_figwidth() * fig.dpi)
+        panel_px = 0.5 * fig_px - 75.0                           # ancho aproximado de un panel
+        # 1. Etiquetas de los brazos.
         longest = max((len(t.get_text()) for t in self.ax_q.get_xticklabels()), default=3)
         needed = self.n_arms * (longest * 6.2 + 6)               # ≈ 6 px por carácter a 8 pt
-        if needed <= width_px:
+        if needed <= panel_px:
             rotation, ha, size = 0.0, "center", 8.5
         elif self.n_arms <= 24:
             rotation, ha, size = 45.0, "right", 8.0
@@ -859,6 +1043,30 @@ class LivePlot:
                 text.set_horizontalalignment(ha)
                 text.set_rotation_mode("anchor" if rotation == 45.0 else "default")
                 text.set_fontsize(size)
+        # 2. Títulos: la versión larga solo si cabe en el panel (y la figura).
+        title_size = plots.PANEL_TITLE_SIZE
+        for key, (long_text, short_text) in PANEL_TITLES.items():
+            if key in self.titles:
+                fits = self._text_width(long_text, title_size, bold=True) <= panel_px + 10
+                self.titles[key].set_text(long_text if fits else short_text)
+        if self._agent is not None and "d" in self.titles:
+            long_text = criterion_title(self.algorithm, self._agent)
+            self.compact_d = self._text_width(long_text, title_size, bold=True) > panel_px + 10
+            self.titles["d"].set_text(criterion_title(self.algorithm, self._agent, compact=self.compact_d))
+        if self.suptitle is not None:
+            long_text, short_text = self.suptitle_texts
+            fits = self._text_width(long_text, SUPTITLE_SIZE, bold=True) <= fig_px - 24
+            self.suptitle.set_text(long_text if fits else short_text)
+        # 3. Leyenda: se rehace solo si cambia el número de columnas.
+        font_px = LEGEND_FONT_SIZE * fig.dpi / 72.0
+        widths = [self._text_width(h.get_label(), LEGEND_FONT_SIZE) for h in self._handles]
+        ncol = legend_columns(widths, fig_px - 16.0, font_px)
+        if self.legend is None or ncol != self.legend_ncol:
+            if self.legend is not None:
+                self.legend.remove()
+            self.legend_ncol = ncol
+            self.legend = plots._legend(fig, self._handles, loc="outside lower center", ncol=ncol,
+                                        fontsize=LEGEND_FONT_SIZE, **LEGEND_OPTS)
 
     # ----------------------------------------------------------- actualización
     def _bar_style(self, rect: Rectangle, highlighted: bool) -> None:
@@ -872,13 +1080,16 @@ class LivePlot:
             rect.set_edgecolor("none")
             rect.set_linewidth(0.0)
 
-    def update(self, session: LiveSession) -> bool:
+    def update(self, session: LiveSession, allow_shrink: bool = True) -> bool:
         """Copia el estado de la sesión a los artistas (sin dibujar).
 
         Parameters
         ----------
         session : LiveSession
             Sesión cuyo estado se muestra.
+        allow_shrink : bool, optional
+            Si es False, la escala del índice UCB solo puede crecer (en modo
+            automático: cada cambio de escala exige un dibujado completo).
 
         Returns
         -------
@@ -928,7 +1139,7 @@ class LivePlot:
         if self.algorithm == "ucb1":
             finite = scores[np.isfinite(scores)]
             need = max(float(finite.max()) if finite.size else 0.0, self.value_lims[1])
-            if need > self.index_top or need < 0.45 * self.index_top:
+            if need > self.index_top or (allow_shrink and need < 0.45 * self.index_top):
                 new_top = nice_ceiling(need * 1.05)
                 if new_top != self.index_top:
                     self.index_top = new_top
@@ -937,7 +1148,8 @@ class LivePlot:
         d_top = self.ax_d.get_ylim()[1]
         for i, rect in enumerate(self.score_bars):
             value = float(scores[i])
-            if math.isinf(value):
+            untried = math.isinf(value) and value > 0
+            if untried:
                 # Brazo sin probar en UCB1: índice +∞ → barra rayada hasta el borde.
                 rect.set_height(d_top)
                 rect.set_facecolor(plots.SURFACE)
@@ -947,7 +1159,10 @@ class LivePlot:
             else:
                 rect.set_height(value if math.isfinite(value) else 0.0)
                 self._bar_style(rect, i == last)
-        self.ax_d.title.set_text(criterion_title(self.algorithm, agent))
+            if i < len(self.inf_texts):
+                self.inf_texts[i].set_visible(untried)
+        if "d" in self.titles:
+            self.titles["d"].set_text(criterion_title(self.algorithm, agent, compact=self.compact_d))
         return changed
 
     def set_count_top(self, top: float) -> None:
@@ -973,13 +1188,14 @@ class LivePlot:
         Returns
         -------
         list[Artist]
-            Barras, rombos de μ (encima de las barras), puntos, media móvil y
-            el título del panel (d) (ε o τ pueden decaer).
+            Barras, rombos de μ (encima de las barras), puntos, media móvil,
+            marcas «∞» de UCB1 y el título del panel (d) (ε o τ pueden decaer).
         """
         if not self.has_session:
             return []
         artists: list[Artist] = [*self.q_bars, self.mu_markers, *self.count_bars, self.points_other,
-                                 self.points_optimal, self.average_line, *self.score_bars, self.ax_d.title]
+                                 self.points_optimal, self.average_line, *self.score_bars, *self.inf_texts,
+                                 self.titles.get("d")]
         return [a for a in artists if a is not None]
 
     def set_animated(self, animated: bool) -> None:
@@ -1032,6 +1248,7 @@ class LiveTab(ttk.Frame):
     """
 
     def __init__(self, master: tk.Misc, app: SmartunerApp) -> None:
+        """Construye los controles, se suscribe a los eventos y muestra la sesión o el mensaje guía."""
         super().__init__(master, padding=(12, 10, 12, 8))
         self.app = app
         self.session: LiveSession | None = None
@@ -1054,6 +1271,8 @@ class LiveTab(ttk.Frame):
         self._finished = False
         self._busy = False
         self._log_has_hint = False
+        self._selection_job: str | None = None
+        self._log_follow = True
 
         self._setup_styles()
         self.columnconfigure(0, weight=1)
@@ -1085,6 +1304,7 @@ class LiveTab(ttk.Frame):
         style.configure("Live.TLabelframe", padding=(10, 6, 10, 8))
         style.configure("Live.TLabelframe.Label", font=("TkDefaultFont", 10, "bold"), foreground=plots.TEXT_PRIMARY)
         style.configure("LiveKey.TLabel", foreground=plots.TEXT_SECONDARY)
+        style.configure("LiveTitle.TLabel", font=("TkDefaultFont", 10, "bold"), foreground=plots.TEXT_PRIMARY)
         style.configure("LiveValue.TLabel", foreground=plots.TEXT_PRIMARY, font=("TkDefaultFont", 10, "bold"))
         style.configure("LiveMuted.TLabel", foreground=plots.TEXT_SECONDARY, font=("TkDefaultFont", 9))
         style.configure("LiveCounter.TLabel", foreground=plots.TEXT_PRIMARY, font=("TkDefaultFont", 12, "bold"))
@@ -1097,64 +1317,118 @@ class LiveTab(ttk.Frame):
                         justify="center")
 
     def _build_selection_bar(self) -> None:
-        """Primera fila: segmento (◀ combo ▶), algoritmo, semilla y traste previo."""
+        """Primera fila: segmento (◀ combo ▶), algoritmo, semilla y traste previo.
+
+        Cada control con su etiqueta va en un grupo (``ttk.Frame``); los grupos
+        se colocan con :meth:`_layout_selection_bar`, que los reparte en dos
+        filas cuando la ventana es estrecha (1024 px) para que nada se corte.
+        """
         bar = ttk.Frame(self)
         bar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
         self.selection_bar = bar
-        col = 0
 
-        ttk.Label(bar, text="Segmento:", style="LiveKey.TLabel").grid(row=0, column=col, padx=(0, 4))
-        col += 1
-        self.prev_button = ttk.Button(bar, text="◀", style="LiveNav.TButton", command=lambda: self._shift_segment(-1))
-        self.prev_button.grid(row=0, column=col)
+        # Segmento: ◀ [combo] ▶
+        seg_group = ttk.Frame(bar)
+        ttk.Label(seg_group, text="Segmento:", style="LiveKey.TLabel").pack(side="left", padx=(0, 4))
+        self.prev_button = ttk.Button(seg_group, text="◀", style="LiveNav.TButton", command=lambda: self._shift_segment(-1))
+        self.prev_button.pack(side="left")
         Tooltip(self.prev_button, HELP["prev"])
-        col += 1
         self.segment_var = tk.StringVar()
-        self.segment_combo = ttk.Combobox(bar, textvariable=self.segment_var, state="readonly", width=38)
-        self.segment_combo.grid(row=0, column=col, padx=2)
+        self.segment_combo = ttk.Combobox(seg_group, textvariable=self.segment_var, state="readonly", width=38)
+        self.segment_combo.pack(side="left", padx=2)
         self.segment_combo.bind("<<ComboboxSelected>>", self._on_segment_combo)
         Tooltip(self.segment_combo, HELP["segment"])
-        col += 1
-        self.next_button = ttk.Button(bar, text="▶", style="LiveNav.TButton", command=lambda: self._shift_segment(1))
-        self.next_button.grid(row=0, column=col, padx=(0, 16))
+        self.next_button = ttk.Button(seg_group, text="▶", style="LiveNav.TButton", command=lambda: self._shift_segment(1))
+        self.next_button.pack(side="left")
         Tooltip(self.next_button, HELP["next"])
-        col += 1
 
-        ttk.Label(bar, text="Algoritmo:", style="LiveKey.TLabel").grid(row=0, column=col, padx=(0, 4))
-        col += 1
+        # Algoritmo (muestra las etiquetas legibles; internamente se usan las claves).
+        algo_group = ttk.Frame(bar)
+        ttk.Label(algo_group, text="Algoritmo:", style="LiveKey.TLabel").pack(side="left", padx=(0, 4))
         self.algo_var = tk.StringVar(value=ALGO_LABELS[self.algorithm])
-        self.algo_combo = ttk.Combobox(bar, textvariable=self.algo_var, state="readonly", width=19,
+        self.algo_combo = ttk.Combobox(algo_group, textvariable=self.algo_var, state="readonly", width=19,
                                        values=[ALGO_LABELS[a] for a in ALGORITHMS])
-        self.algo_combo.grid(row=0, column=col, padx=(0, 16))
+        self.algo_combo.pack(side="left")
         self.algo_combo.bind("<<ComboboxSelected>>", self._on_algo_combo)
         Tooltip(self.algo_combo, HELP["algorithm"])
-        col += 1
 
-        seed_label = ttk.Label(bar, text="Semilla:", style="LiveKey.TLabel")
-        seed_label.grid(row=0, column=col, padx=(0, 4))
-        col += 1
+        # Semilla.
+        seed_group = ttk.Frame(bar)
+        seed_label = ttk.Label(seed_group, text="Semilla:", style="LiveKey.TLabel")
+        seed_label.pack(side="left", padx=(0, 4))
         spec = PARAM_SPECS["experiment.seed"]
         self.seed_var = tk.StringVar(value=str(self.app.state.config.experiment.seed))
-        self.seed_spin = ttk.Spinbox(bar, textvariable=self.seed_var, width=7, from_=spec.minimum or 0,
+        self.seed_spin = ttk.Spinbox(seed_group, textvariable=self.seed_var, width=7, from_=spec.minimum or 0,
                                      to=spec.maximum or 2**31 - 1, increment=1, command=self._on_seed_entered)
-        self.seed_spin.grid(row=0, column=col, padx=(0, 16))
+        self.seed_spin.pack(side="left")
         self.seed_spin.bind("<Return>", lambda _e: self._on_seed_entered())
         self.seed_spin.bind("<FocusOut>", lambda _e: self._on_seed_entered())
         Tooltip(seed_label, HELP["seed"])
         Tooltip(self.seed_spin, HELP["seed"])
-        col += 1
 
-        prev_key = ttk.Label(bar, text="Traste previo:", style="LiveKey.TLabel")
-        prev_key.grid(row=0, column=col, padx=(0, 4))
-        col += 1
-        self.prev_fret_label = ttk.Label(bar, text="—", style="LiveValue.TLabel")
-        self.prev_fret_label.grid(row=0, column=col)
-        col += 1
-        self.prev_fret_source_label = ttk.Label(bar, text="", style="LiveMuted.TLabel")
-        self.prev_fret_source_label.grid(row=0, column=col, padx=(6, 0), sticky="w")
-        bar.columnconfigure(col, weight=1)
+        # Traste previo usado (solo lectura) y de dónde sale.
+        prev_group = ttk.Frame(bar)
+        prev_key = ttk.Label(prev_group, text="Traste previo:", style="LiveKey.TLabel")
+        prev_key.pack(side="left", padx=(0, 4))
+        self.prev_fret_label = ttk.Label(prev_group, text="—", style="LiveValue.TLabel")
+        self.prev_fret_label.pack(side="left")
+        self.prev_fret_source_label = ttk.Label(prev_group, text="", style="LiveMuted.TLabel")
+        self.prev_fret_source_label.pack(side="left", padx=(6, 0))
         for widget in (prev_key, self.prev_fret_label, self.prev_fret_source_label):
             Tooltip(widget, self._prev_fret_help)
+
+        self._selection_groups = (seg_group, algo_group, seed_group, prev_group)
+        self._selection_rows = 0                    # 0 = aún sin colocar; 1 o 2 filas
+        self._layout_selection_bar(1 << 16)
+        bar.bind("<Configure>", lambda e: self._layout_selection_bar(e.width), add="+")
+
+    def _layout_selection_bar(self, width: int) -> None:
+        """Coloca los grupos de la primera fila en una o dos filas según el ancho disponible.
+
+        Con la ventana ancha todo va en una fila; si no cabe (≈ 1024 px), la
+        semilla y el traste previo pasan a una segunda fila. Solo se vuelve a
+        colocar cuando cambia la decisión (evita bucles de ``<Configure>``).
+
+        Parameters
+        ----------
+        width : int
+            Ancho de la barra en píxeles.
+        """
+        gap = 16
+        groups = self._selection_groups
+        needed = sum(g.winfo_reqwidth() for g in groups) + gap * (len(groups) - 1)
+        rows = 1 if needed <= width else 2
+        if rows == self._selection_rows:
+            return
+        self._selection_rows = rows
+        for group in groups:
+            group.grid_forget()
+        if rows == 1:
+            for col, group in enumerate(groups):
+                group.grid(row=0, column=col, sticky="w", padx=(0, gap if col < len(groups) - 1 else 0))
+        else:
+            seg_group, algo_group, seed_group, prev_group = groups
+            seg_group.grid(row=0, column=0, sticky="w", padx=(0, gap))
+            algo_group.grid(row=0, column=1, columnspan=2, sticky="w")
+            seed_group.grid(row=1, column=0, sticky="w", pady=(6, 0))
+            prev_group.grid(row=1, column=1, columnspan=2, sticky="w", pady=(6, 0))
+
+    def _relayout_selection_bar(self) -> None:
+        """Revisa la colocación de la primera fila cuando cambia un texto (tras calcular tamaños)."""
+        if self._selection_job is None:
+            self._selection_job = self.after_idle(self._relayout_selection_bar_now)
+
+    def _relayout_selection_bar_now(self) -> None:
+        """Aplica :meth:`_layout_selection_bar` con el ancho real de la barra."""
+        self._selection_job = None
+        width = self.selection_bar.winfo_width()
+        if width > 1:
+            self._layout_selection_bar(width)
+
+    @property
+    def selection_rows(self) -> int:
+        """Filas que ocupa la barra de selección (1 con ventana ancha, 2 si es estrecha)."""
+        return self._selection_rows
 
     def _build_playback_bar(self) -> None:
         """Segunda fila: botones de ejecución, velocidad y contador t / T."""
@@ -1179,7 +1453,7 @@ class LiveTab(ttk.Frame):
         speed_key = ttk.Label(bar, text="Velocidad:", style="LiveKey.TLabel")
         speed_key.grid(row=0, column=col, padx=(0, 4))
         col += 1
-        self.speed_scale = ttk.Scale(bar, from_=0.0, to=scale_from_speed(MAX_SPEED), orient="horizontal", length=150)
+        self.speed_scale = ttk.Scale(bar, from_=0.0, to=scale_from_speed(MAX_SPEED), orient="horizontal", length=140)
         self.speed_scale.set(scale_from_speed(self.speed))
         self.speed_scale.grid(row=0, column=col)
         col += 1
@@ -1194,7 +1468,7 @@ class LiveTab(ttk.Frame):
         self.t_label = ttk.Label(bar, text="t = 0 / 0", style="LiveCounter.TLabel")
         self.t_label.grid(row=0, column=col, padx=(8, 8))
         col += 1
-        self.progress = ttk.Progressbar(bar, length=140, mode="determinate", maximum=1.0)
+        self.progress = ttk.Progressbar(bar, length=120, mode="determinate", maximum=1.0)
         self.progress.grid(row=0, column=col)
         for widget in (self.t_label, self.progress):
             Tooltip(widget, HELP["t"])
@@ -1258,14 +1532,24 @@ class LiveTab(ttk.Frame):
             ("pct", "Pulls al óptimo:"),
         )
         self.status_values: dict[str, ttk.Label] = {}
+        names: list[ttk.Label] = []
         for row, (key, text) in enumerate(rows):
             name = ttk.Label(box, text=text, style="LiveKey.TLabel")
-            name.grid(row=row, column=0, sticky="w", padx=(0, 8), pady=1)
-            value = ttk.Label(box, text="—", style="LiveValue.TLabel", anchor="w")
+            name.grid(row=row, column=0, sticky="nw", padx=(0, 8), pady=1)
+            value = ttk.Label(box, text="—", style="LiveValue.TLabel", anchor="w", justify="left", wraplength=220)
             value.grid(row=row, column=1, sticky="ew", pady=1)
             Tooltip(name, HELP[key])
             Tooltip(value, HELP[key])
             self.status_values[key] = value
+            names.append(name)
+
+        def wrap_values(event: tk.Event) -> None:
+            """Ajusta el ancho de línea de los valores al ancho del recuadro (no se cortan)."""
+            key_width = max(n.winfo_reqwidth() for n in names)
+            for label in self.status_values.values():
+                label.configure(wraplength=max(120, event.width - key_width - 36))
+
+        box.bind("<Configure>", wrap_values, add="+")
         self.result_label = tk.Label(box, text="", anchor="w", justify="left", wraplength=320,
                                      background=plots.HIGHLIGHT, foreground=plots.TEXT_PRIMARY,
                                      font=("TkDefaultFont", 9), padx=8, pady=5)
@@ -1275,7 +1559,9 @@ class LiveTab(ttk.Frame):
 
     def _build_log_box(self, parent: ttk.Frame) -> None:
         """Registro de decisiones: un ``PullEvent.text`` por línea, fuente monoespaciada."""
-        box = ttk.LabelFrame(parent, text="Registro de decisiones (un pull por línea)", style="Live.TLabelframe")
+        # El título es un Label propio: su tooltip sale al pasar por el título, no al leer el registro.
+        title = ttk.Label(parent, text="Registro de decisiones (un pull por línea)", style="LiveTitle.TLabel")
+        box = ttk.LabelFrame(parent, labelwidget=title, style="Live.TLabelframe")
         box.grid(row=1, column=0, sticky="nsew", pady=(0, 8))
         box.columnconfigure(0, weight=1)
         box.rowconfigure(0, weight=1)
@@ -1298,7 +1584,8 @@ class LiveTab(ttk.Frame):
         self.log.tag_configure("hint", foreground=plots.TEXT_SECONDARY, lmargin2=0)
         self.log.tag_configure("summary", font=self.log_font_bold, background=plots.HIGHLIGHT, lmargin2=indent)
         self.log.configure(state="disabled")
-        Tooltip(box, HELP["log"])
+        self.log.bind("<Configure>", self._on_log_configure, add="+")
+        Tooltip(title, HELP["log"])
 
     def _build_explanation_box(self, parent: ttk.Frame) -> None:
         """Recuadro inferior: qué muestra el panel (d) para el algoritmo elegido."""
@@ -1426,7 +1713,7 @@ class LiveTab(ttk.Frame):
             if len(prev) == n_segments and 0 <= position < len(prev):
                 if position == 0:
                     return prev[0], "posición inicial de la mano"
-                return prev[position], f"según la tablatura de {ALGO_LABELS.get(algorithm, algorithm)}"
+                return prev[position], f"según la tablatura de {ALGO_SHORT.get(algorithm, algorithm)}"
         return self.app.state.config.env.initial_hand_fret, "posición inicial (sin tablatura)"
 
     def _prev_fret_help(self) -> str:
@@ -1449,13 +1736,31 @@ class LiveTab(ttk.Frame):
         hi = int(spec.maximum or 2**31 - 1)
         return seed if lo <= seed <= hi else None
 
-    def _figure_title(self, session: LiveSession) -> str:
-        """Título de la figura con el contexto de la sesión."""
+    @staticmethod
+    def figure_titles(session: LiveSession) -> tuple[str, str]:
+        """Título de la figura con el contexto de la sesión (versión larga y corta).
+
+        Parameters
+        ----------
+        session : LiveSession
+            Sesión dibujada.
+
+        Returns
+        -------
+        tuple[str, str]
+            P. ej. ``("UCB1 · nota n.º 3 (f0 55.0 Hz ≈ A1) · traste previo 0 · semilla 42 · T = 500 pulls",
+            "UCB1 · nota n.º 3 (A1) · traste previo 0 · semilla 42")``.
+        """
         seg = session.data.segment
+        name = ALGO_LABELS.get(session.algorithm, session.algorithm)
         f0 = f"f0 {seg.f0_hz:.1f} Hz ≈ {note_name(seg.f0_hz)}" if seg.f0_hz else "f0 desconocida"
         prev = "ninguno" if session.prev_fret is None else str(session.prev_fret)
-        return (f"{ALGO_LABELS.get(session.algorithm, session.algorithm)} · nota n.º {session.data.position} "
-                f"({f0}) · traste previo {prev} · semilla {session.cfg.experiment.seed} · T = {session.budget} pulls")
+        seed = session.cfg.experiment.seed
+        long_title = (f"{name} · nota n.º {session.data.position} ({f0}) · traste previo {prev} · "
+                      f"semilla {seed} · T = {session.budget} pulls")
+        short_title = (f"{name} · nota n.º {session.data.position} ({note_name(seg.f0_hz)}) · "
+                       f"traste previo {prev} · semilla {seed}")
+        return long_title, short_title
 
     def _new_session(self) -> None:
         """Crea una sesión para (segmento, algoritmo, semilla) actuales con la configuración vigente."""
@@ -1493,9 +1798,10 @@ class LiveTab(ttk.Frame):
         self._fill_segment_combo()
         self.prev_fret_label.configure(text="ninguno" if prev is None else str(prev))
         self.prev_fret_source_label.configure(text=f"({source})")
+        self._relayout_selection_bar()
         self.explanation_label.configure(text=criterion_explanation(self.algorithm, cfg))
         self.result_label.grid_remove()
-        self.live_plot.build(session, self._figure_title(session))
+        self.live_plot.build(session, *self.figure_titles(session))
         self._clear_log()
         self._refresh_status()
         self._update_banner()
@@ -1672,6 +1978,8 @@ class LiveTab(ttk.Frame):
         La velocidad se mide con el reloj: cada tick suma velocidad·Δt pulls
         de crédito y da la parte entera. Así, aunque un dibujado se retrase,
         la velocidad media se mantiene (con Δt acotado a :data:`MAX_CATCHUP_S`).
+        El siguiente tick se programa descontando lo que tardó este (pulls +
+        registro + *blitting*), para sostener ≈ 25 redibujados por segundo.
         """
         self._auto_job = None
         session = self.session
@@ -1687,7 +1995,10 @@ class LiveTab(ttk.Frame):
             self.step(n)
         if not self.running or self.session is None or self.session.done:
             return
-        self._auto_job = self.after(tick_interval_ms(self.speed), self._auto_tick)
+        work_ms = (time.perf_counter() - now) * 1000.0
+        # Al menos MIN_TICK_GAP_MS de respiro: deja a Tk procesar el ratón y los dibujados diferidos.
+        delay = max(MIN_TICK_GAP_MS, int(round(tick_interval_ms(self.speed) - work_ms)))
+        self._auto_job = self.after(delay, self._auto_tick)
 
     def _stop_auto(self, redraw: bool = True) -> None:
         """Detiene el modo automático y vuelve al dibujado normal (sin *blitting*).
@@ -1732,8 +2043,8 @@ class LiveTab(ttk.Frame):
             return
         self._finished = True
         self._stop_auto(redraw=True)
-        index = session.agent.recommend(session.cfg.agent.recommend)
-        arm = session.data.arms[index]
+        arm = session.recommended_arm()
+        index = session.data.arms.index(arm)
         optimal = [session.data.arms[i].label for i in session.env.optimal_arms]
         hit = session.env.is_optimal(index)
         n_opt = sum(1 for e in session.events if e.is_optimal)
@@ -1767,7 +2078,7 @@ class LiveTab(ttk.Frame):
         """
         if self.session is None:
             return
-        changed = self.live_plot.update(self.session)
+        changed = self.live_plot.update(self.session, allow_shrink=not self._blitting)
         if not self.winfo_ismapped():
             self._dirty = True            # se dibuja al volver a la pestaña (<Map>)
             return
@@ -1818,7 +2129,7 @@ class LiveTab(ttk.Frame):
         self._background = None
         self._full_pending = True
         if self.live_plot.has_session:
-            self.live_plot.apply_tick_layout()
+            self.live_plot.apply_responsive_layout()
             self.plot.figure.set_layout_engine("constrained", **LAYOUT_PADS)
 
     def _on_map(self, event: tk.Event) -> None:
@@ -1845,6 +2156,7 @@ class LiveTab(ttk.Frame):
         self.log.insert("end", LOG_HINT, ("hint",))
         self.log.configure(state="disabled")
         self._log_has_hint = True
+        self._log_follow = True
 
     def _append_log(self, events: list[PullEvent]) -> None:
         """Añade un ``PullEvent.text`` por línea (encabezado en negrita) y resalta el último.
@@ -1878,17 +2190,30 @@ class LiveTab(ttk.Frame):
         if lines > MAX_LOG_LINES + 1:
             log.delete("1.0", f"{lines - MAX_LOG_LINES}.0")
         log.configure(state="disabled")
+        self._log_follow = at_bottom
         if at_bottom:
             log.see("end")
 
     def _append_summary(self, text: str) -> None:
-        """Añade la línea de resumen final al registro."""
+        """Añade la línea de resumen final al registro y la deja a la vista.
+
+        Parameters
+        ----------
+        text : str
+            Resumen de la sesión.
+        """
         log = self.log
         log.configure(state="normal")
         log.tag_remove("latest", "1.0", "end")
         log.insert("end", text + "\n", ("summary",))
         log.configure(state="disabled")
         log.see("end")
+        self._log_follow = True
+
+    def _on_log_configure(self, _event: tk.Event) -> None:
+        """El registro cambió de tamaño (p. ej. al aparecer el resumen): si seguía el final, lo mantiene a la vista."""
+        if self._log_follow:
+            self.log.see("end")
 
     @property
     def log_lines(self) -> list[str]:
@@ -1918,9 +2243,9 @@ class LiveTab(ttk.Frame):
             values["regret"].configure(text="0.00")
             values["pct"].configure(text="—")
             return
-        index = session.agent.recommend(session.cfg.agent.recommend)
-        mark = "✓ óptimo" if env.is_optimal(index) else "✗ no es el óptimo"
-        values["recommended"].configure(text=f"{data.arms[index].label}  {mark}")
+        arm = session.recommended_arm()
+        mark = "✓ óptimo" if env.is_optimal(data.arms.index(arm)) else "✗ no es el óptimo"
+        values["recommended"].configure(text=f"{arm.label}  {mark}")
         last = session.events[-1]
         kind = KIND_TEXT.get(last.decision.kind, last.decision.kind)
         values["last"].configure(text=f"{last.arm_label} · r = {last.reward:.2f} · {kind}")
@@ -1937,6 +2262,7 @@ class LiveTab(ttk.Frame):
         n_segments = len(self._segment_data()) if self.app.state.analysis is not None else 0
 
         def state(widget: ttk.Widget, enabled: bool) -> None:
+            """Habilita (``enabled``) o deshabilita un widget ttk."""
             widget.state(["!disabled"] if enabled else ["disabled"])
 
         state(self.step_button, has and not done and not self.running)
@@ -2097,13 +2423,13 @@ class LiveTab(ttk.Frame):
     # ============================================================ limpieza
     def destroy(self) -> None:
         """Cancela los temporizadores pendientes antes de destruir la pestaña."""
-        for job in (self._auto_job, self._rebuild_job):
+        for job in (self._auto_job, self._rebuild_job, self._selection_job):
             if job is not None:
                 try:
                     self.after_cancel(job)
                 except tk.TclError:
                     pass
-        self._auto_job = self._rebuild_job = None
+        self._auto_job = self._rebuild_job = self._selection_job = None
         super().destroy()
 
 
@@ -2111,5 +2437,5 @@ __all__ = [
     "LiveTab", "LivePlot", "SOURCE", "speed_from_scale", "scale_from_speed", "tick_interval_ms", "nice_ceiling",
     "count_axis_top", "moving_average", "moving_window", "segment_label", "reward_range", "value_limits",
     "criterion_title", "criterion_explanation", "pending_changes", "format_change", "arm_tick_labels",
-    "data_param_keys", "note_name",
+    "data_param_keys", "note_name", "legend_columns", "panel_title",
 ]
