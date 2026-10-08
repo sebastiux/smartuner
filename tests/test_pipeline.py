@@ -199,7 +199,7 @@ def test_analyze_missing_file_raises(tmp_path: Path) -> None:
 
 
 def test_analyze_with_separation_uses_stem(ks_item: DatasetItem, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Con ``separate_bass`` se analiza el stem que devuelve Demucs (aquí simulado) y el GT
+    """Con ``separate_bass`` y método «demucs» se analiza el stem que devuelve Demucs (aquí simulado) y el GT
     se sigue buscando junto al archivo ORIGINAL."""
     from src import separation
 
@@ -218,8 +218,10 @@ def test_analyze_with_separation_uses_stem(ks_item: DatasetItem, tmp_path: Path,
         return stem
 
     monkeypatch.setattr(separation, "separate_bass", fake_separate)
+    monkeypatch.setattr(separation, "demucs_available", lambda: True)
     cfg = Config()
     cfg.audio.separate_bass = True
+    cfg.audio.separation_method = "demucs"
     fractions: list[float] = []
     res = analyze(ks_item.mp3_path, cfg, progress=lambda f, m: fractions.append(f))
     assert calls == {"path": ks_item.mp3_path, "model": cfg.audio.demucs_model}
@@ -237,9 +239,85 @@ def test_analyze_separation_cancel_propagates(ks_item: DatasetItem, monkeypatch:
         raise separation.SeparationCancelledError("cancelado")
 
     monkeypatch.setattr(separation, "separate_bass", cancelled)
+    monkeypatch.setattr(separation, "demucs_available", lambda: True)
+    cfg = Config()
+    cfg.audio.separate_bass = True  # método «auto» con Demucs "instalado" → Demucs
+    with pytest.raises(CancelledError):
+        analyze(ks_item.mp3_path, cfg)
+
+
+def test_analyze_with_hpss_separation(ks_item: DatasetItem, monkeypatch: pytest.MonkeyPatch,
+                                      caplog: pytest.LogCaptureFixture) -> None:
+    """Método «hpss»: y_raw es la señal separada en memoria, source_path el archivo original, y las notas siguen ahí."""
+    from src import separation
+
+    def forbidden(*args: object, **kwargs: object) -> Path:
+        """Demucs no debe ejecutarse con el método «hpss»."""
+        raise AssertionError("se llamó a Demucs con separation_method='hpss'")
+
+    calls: list[int] = []
+    real_hpss = separation.hpss_bass
+
+    def spy_hpss(y: np.ndarray, sr: int) -> np.ndarray:
+        """HPSS real, registrando la llamada."""
+        calls.append(len(y))
+        return real_hpss(y, sr)
+
+    monkeypatch.setattr(separation, "separate_bass", forbidden)
+    monkeypatch.setattr(separation, "hpss_bass", spy_hpss)
+    monkeypatch.setattr(separation, "demucs_available", lambda: True)  # aun instalado, se respeta «hpss»
     cfg = Config()
     cfg.audio.separate_bass = True
-    with pytest.raises(CancelledError):
+    cfg.audio.separation_method = "hpss"
+    messages: list[str] = []
+    with caplog.at_level(logging.INFO, logger="src.pipeline"):
+        res = analyze(ks_item.mp3_path, cfg, progress=lambda f, m: messages.append(m))
+    plain, _ = io_audio.load_audio(ks_item.mp3_path, sr=22050)
+    assert calls == [len(plain)]
+    assert res.source_path == ks_item.mp3_path and res.path == ks_item.mp3_path
+    assert len(res.y_raw) == len(plain) and not np.allclose(res.y_raw, plain)
+    assert any("HPSS" in m for m in messages)
+    assert "método elegido" in caplog.text
+    # Un bajo limpio sobrevive a HPSS: se siguen encontrando casi todas las notas con su f0.
+    matches = match_segments_to_gt(res.kept, res.ground_truth, ONSET_TOL_S)
+    matched = [(k, j) for k, j in enumerate(matches) if j is not None]
+    assert len(matched) >= 0.8 * len(res.ground_truth)
+    correct = sum(1 for k, j in matched
+                  if res.kept[j].f0_hz is not None and round(hz_to_midi(res.kept[j].f0_hz)) == res.ground_truth[k].midi)
+    assert correct >= 0.8 * len(matched)
+
+
+def test_analyze_auto_without_demucs_uses_hpss(ks_item: DatasetItem, monkeypatch: pytest.MonkeyPatch,
+                                               caplog: pytest.LogCaptureFixture) -> None:
+    """«auto» sin Demucs instalado usa HPSS y lo explica en el log."""
+    from src import separation
+
+    used: list[str] = []
+    monkeypatch.setattr(separation, "demucs_available", lambda: False)
+    monkeypatch.setattr(separation, "hpss_bass", lambda y, sr: used.append("hpss") or y)
+    cfg = Config()
+    cfg.audio.separate_bass = True
+    with caplog.at_level(logging.INFO, logger="src.pipeline"):
+        res = analyze(ks_item.mp3_path, cfg)
+    assert used == ["hpss"]
+    assert res.config.audio.separation_method == "auto"
+    assert "automático: Demucs no está instalado" in caplog.text
+
+
+def test_analyze_demucs_requested_but_missing_fails_early(ks_item: DatasetItem, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pedir «demucs» sin tenerlo instalado da SeparationError con instrucciones ANTES de decodificar el audio."""
+    from src import separation
+
+    def no_decode(*args: object, **kwargs: object) -> None:
+        """No debe decodificarse nada: el error llega antes."""
+        raise AssertionError("se decodificó el audio antes de comprobar Demucs")
+
+    monkeypatch.setattr(separation, "demucs_available", lambda: False)
+    monkeypatch.setattr(io_audio, "load_audio", no_decode)
+    cfg = Config()
+    cfg.audio.separate_bass = True
+    cfg.audio.separation_method = "demucs"
+    with pytest.raises(separation.SeparationError, match="pip install demucs"):
         analyze(ks_item.mp3_path, cfg)
 
 

@@ -113,6 +113,10 @@ STRING_ORDER: tuple[str, ...] = ("E", "A", "D", "G")
 #: pYIN ya no abarca dos periodos de 41 Hz). :meth:`Config.validate` la exige.
 SUPPORTED_SAMPLE_RATE: int = 22050
 
+#: Métodos de separación del bajo (``audio.separation_method``): ``"auto"``
+#: (Demucs si está instalado, si no HPSS), ``"demucs"`` y ``"hpss"``.
+SEPARATION_METHODS: tuple[str, ...] = ("auto", "demucs", "hpss")
+
 PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent
 DATA_DIR: Path = PROJECT_ROOT / "data"
 CACHE_DIR: Path = PROJECT_ROOT / "cache"
@@ -135,14 +139,28 @@ class AudioConfig:
         (:data:`SUPPORTED_SAMPLE_RATE`): los tamaños de ventana en muestras de
         las demás etapas están calibrados para ella (ver :meth:`Config.validate`).
     separate_bass : bool
-        Si es True se ejecuta Demucs para aislar el bajo de una mezcla.
+        Si es True se aísla el bajo de una mezcla (etapa 2) con el método
+        ``separation_method``.
     demucs_model : str
         Nombre del modelo de Demucs (``"htdemucs"``).
+    separation_method : str
+        Cómo se separa el bajo cuando ``separate_bass`` es True (ver
+        :data:`SEPARATION_METHODS`):
+
+        * ``"auto"`` (por defecto): Demucs si está instalado; si no, HPSS.
+        * ``"demucs"``: red neuronal Demucs (la mejor calidad; requiere
+          PyTorch y tarda minutos en CPU). Si no está instalado, el análisis
+          falla con instrucciones de instalación.
+        * ``"hpss"``: separación armónico-percusiva + pasa-bajas con librosa
+          (segundos, sin dependencias extra). Es una aproximación: quita
+          batería, efectos percusivos y voces/platillos agudos, pero no las
+          guitarras ni los teclados graves.
     """
 
     sample_rate: int = 22050
     separate_bass: bool = False
     demucs_model: str = "htdemucs"
+    separation_method: str = "auto"
 
 
 @dataclass
@@ -618,7 +636,8 @@ class Config:
         """Comprueba tipos, rangos y restricciones entre parámetros.
 
         Se comprueban: el tipo de cada campo; el rango (o las opciones) de
-        cada parámetro de :data:`PARAM_SPECS`; que las listas de los barridos
+        cada parámetro de :data:`PARAM_SPECS` (p. ej. ``audio.separation_method``
+        debe ser uno de :data:`SEPARATION_METHODS`); que las listas de los barridos
         no estén vacías y queden en el rango del parámetro barrido; y las
         restricciones que no caben en un rango: frecuencia de muestreo
         soportada, salto entre frames, 0 < fmin < fmax < sr/2 de pYIN con al
@@ -939,6 +958,15 @@ class ParamSpec:
 
 #: Especificación de cada parámetro editable, indexada por ``"seccion.campo"``.
 PARAM_SPECS: dict[str, ParamSpec] = {
+    # --- Audio (etapa 2: separación) ---
+    "audio.separation_method": ParamSpec(
+        "Método de separación del bajo", "Cómo se aísla el bajo de una mezcla cuando está marcada «Separar "
+        "bajo de mezcla». «auto»: Demucs si está instalado y, si no, HPSS. «demucs»: red neuronal Demucs, "
+        "la mejor calidad (quita voz, batería, guitarras y teclados), pero requiere PyTorch (pip install "
+        "demucs), descarga ~80 MB de pesos la primera vez y tarda varios minutos por canción en CPU. "
+        "«hpss»: separación armónico-percusiva de librosa + pasa-bajas de 1.2 kHz; tarda segundos y no "
+        "necesita nada más, pero es una aproximación: quita batería, efectos percusivos y voces/platillos "
+        "agudos, no las guitarras ni los teclados graves.", "choice", choices=SEPARATION_METHODS),
     # --- Preprocesamiento / segmentación / pitch ---
     "preprocess.lowpass_hz": ParamSpec(
         "Corte pasa-bajas", "Frecuencia de corte del filtro Butterworth aplicado a la señal de "

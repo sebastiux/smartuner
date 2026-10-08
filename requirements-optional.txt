@@ -1,7 +1,23 @@
 # Dependencias opcionales.
-# Reproducción de audio desde la GUI (requiere PortAudio en el sistema):
+#   pip install -r requirements-optional.txt
+#
+# Reproducción de audio desde la GUI (requiere PortAudio en el sistema; las ruedas de
+# Windows y macOS ya lo incluyen):
 sounddevice>=0.4.6
-# Separación de fuentes (checkbox "Separar bajo de mezcla"); instala PyTorch (pesado):
+#
+# Separación del bajo con Demucs ("Separar bajo de mezcla", método «demucs» o «auto»).
+# En Windows basta con (en la misma terminal/venv con que ejecutas Smartuner):
+#     pip install demucs
+# Eso instala también PyTorch para CPU (~1-2 GB en disco; no hace falta GPU ni CUDA).
+# La PRIMERA separación descarga los pesos del modelo htdemucs (~80 MB, necesita
+# Internet); después quedan en la caché de tu carpeta de usuario y funciona sin conexión.
+# En CPU tarda varios minutos por canción (del orden de la duración de la pista);
+# el resultado se guarda en cache/ y volver a abrir la misma canción es instantáneo.
+# Smartuner llama a Demucs por su API (src/demucs_runner.py), así que NO necesita
+# ffmpeg en el PATH, torchaudio ni torchcodec.
+# Sin Demucs, el método «auto» usa HPSS (librosa, incluido en requirements.txt):
+# segundos en lugar de minutos, pero solo aproximado.
 demucs>=4.0.1
+#
 # Además, para el dataset sintético con sonido realista: fluidsynth + un soundfont GM
 # (p. ej. FluidR3_GM.sf2). Sin ellos se usa un sintetizador Karplus-Strong integrado.

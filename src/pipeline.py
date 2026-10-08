@@ -8,8 +8,8 @@ necesitan los agentes, las gráficas y la evaluación. Ninguna de las dos
 conoce el orden interno de las etapas, que es::
 
     archivo.mp3
-       │ 1. Carga (src.io_audio): ffmpeg → mono float32 a cfg.audio.sample_rate
-       │ 2. Separación opcional (src.separation): Demucs aísla el bajo de una mezcla
+       │ 1. Carga (src.io_audio): ffmpeg (o soundfile) → mono float32 a cfg.audio.sample_rate
+       │ 2. Separación opcional (src.separation): Demucs o HPSS aíslan el bajo de una mezcla
        ▼
     y_raw ──3. Preprocesamiento (src.preprocessing)──┬──► y_analysis (pasa-bajas + normalizada)
                                                      └──► y_spectral (solo normalizada)
@@ -33,6 +33,19 @@ Onsets, pYIN y espectro usan el mismo salto ``cfg.segmentation.hop_length``
 (256 muestras ≈ 11.6 ms a 22 050 Hz): un frame de pYIN y un frame del espectro
 corresponden al mismo instante, lo que simplifica las gráficas y la selección
 de frames de cada segmento.
+
+Separación del bajo (etapa 2)
+-----------------------------
+Solo si ``cfg.audio.separate_bass``. El método sale de
+``cfg.audio.separation_method`` (:func:`src.separation.resolve_method`):
+``"auto"`` usa Demucs si está instalado y, si no, HPSS; ``"demucs"`` exige
+Demucs (si falta, :class:`src.separation.SeparationError` con instrucciones).
+
+* **Demucs** escribe un stem ``<caché>/<clave>_bass.wav``: ``source_path`` es
+  ese archivo y ``y_raw`` se vuelve a cargar desde él.
+* **HPSS** trabaja sobre la señal ya cargada y NO escribe ningún archivo:
+  ``y_raw`` pasa a ser la señal separada y ``source_path`` sigue siendo el
+  archivo original (no hay otro archivo que señalar).
 
 Progreso y cancelación
 ----------------------
@@ -68,11 +81,13 @@ from src.synth_dataset import GTNote
 logger = logging.getLogger(__name__)
 
 #: Peso relativo (≈ coste de cómputo) de cada etapa, para repartir la barra de
-#: progreso. Solo importan las proporciones; ``separation`` se omite si no se
-#: separa el bajo.
+#: progreso. Solo importan las proporciones; ``separation`` (Demucs: minutos en
+#: CPU) o ``separation_hpss`` (HPSS: segundos, ~1/5 de lo que tarda pYIN) se
+#: omiten si no se separa el bajo.
 STAGE_WEIGHTS: dict[str, float] = {
     "load": 0.06,
     "separation": 0.60,
+    "separation_hpss": 0.08,
     "preprocess": 0.03,
     "segmentation": 0.08,
     "pitch": 0.45,
@@ -108,11 +123,15 @@ class AnalysisResult:
     path : Path
         Archivo de entrada elegido por el usuario.
     source_path : Path
-        Archivo efectivamente analizado (el stem de Demucs si hubo separación).
+        Archivo efectivamente analizado: el stem de Demucs si se separó con
+        Demucs; con HPSS (que no escribe archivos) o sin separación, el
+        archivo original.
     sr : int
         Frecuencia de muestreo (Hz).
     y_raw : np.ndarray
-        Señal decodificada (mono, sin procesar), forma ``(n_muestras,)``.
+        Señal decodificada (mono, sin preprocesar), forma ``(n_muestras,)``.
+        Con separación es el bajo aislado (el stem de Demucs o la salida de
+        :func:`src.separation.hpss_bass`).
     y_analysis : np.ndarray
         Señal filtrada + normalizada (onsets, pYIN).
     y_spectral : np.ndarray
@@ -323,7 +342,8 @@ def analyze(
     src.io_audio.AudioLoadError, src.io_audio.FFmpegNotFoundError
         Si el audio no se puede decodificar.
     src.separation.SeparationError
-        Si se pidió separar el bajo y Demucs no está disponible o falla.
+        Si se pidió separar el bajo con Demucs (``separation_method="demucs"``)
+        y no está instalado, o si Demucs falla.
 
     Notes
     -----
@@ -353,8 +373,11 @@ def analyze(
     sr = int(cfg.audio.sample_rate)
     hop = int(cfg.segmentation.hop_length)
 
-    stages = ["load"] + (["separation"] if cfg.audio.separate_bass else []) + [
-        "preprocess", "segmentation", "pitch", "spectrum", "bandit", "ground_truth"]
+    # El método de separación se resuelve ANTES de cargar: si se pidió Demucs
+    # y no está instalado, se falla enseguida con las instrucciones.
+    method = separation.resolve_method(cfg.audio.separation_method) if cfg.audio.separate_bass else None
+    sep_stage = {"demucs": ["separation"], "hpss": ["separation_hpss"]}.get(method or "", [])
+    stages = ["load"] + sep_stage + ["preprocess", "segmentation", "pitch", "spectrum", "bandit", "ground_truth"]
     rep = _StageReporter(stages, progress, cancel)
     logger.info("Análisis de %s (%d Hz, hop=%d muestras = %.1f ms)", path.name, sr, hop, 1000.0 * hop / sr)
 
@@ -364,13 +387,23 @@ def analyze(
     y_raw, sr = io_audio.load_audio(path, sr=sr)
     source_path = path
 
-    # 2. Separación opcional: Demucs aísla el bajo y se analiza ese stem.
-    if cfg.audio.separate_bass:
-        rep.begin("separation", f"Etapa 2/6 — Separación: aislando el bajo con Demucs ({cfg.audio.demucs_model})")
+    # 2. Separación opcional (ver "Separación del bajo" en el encabezado).
+    if method == "demucs":
+        how = "elegido" if cfg.audio.separation_method == "demucs" else "automático: Demucs está instalado"
+        rep.begin("separation", f"Etapa 2/6 — Separación: aislando el bajo con Demucs "
+                                f"({cfg.audio.demucs_model}; método {how})")
         source_path = separation.separate_bass(
             path, model=cfg.audio.demucs_model, progress=rep.sub_progress("separation"), cancel=cancel)
         logger.info("Separación: se analizará el stem de bajo %s", source_path.name)
         y_raw, sr = io_audio.load_audio(source_path, sr=sr)
+    elif method == "hpss":
+        how = ("elegido" if cfg.audio.separation_method == "hpss"
+               else "automático: Demucs no está instalado (pip install demucs para mejor calidad)")
+        rep.begin("separation_hpss", f"Etapa 2/6 — Separación: aproximando el bajo con HPSS (componente armónica "
+                                     f"+ pasa-bajas; método {how})")
+        y_raw = separation.hpss_bass(y_raw, sr)
+        logger.info("Separación HPSS: se analizará la señal separada en memoria (no se escribe archivo; "
+                    "source_path sigue siendo %s)", path.name)
     else:
         logger.info("Etapa 2/6 — Separación: omitida (se asume que el audio ya es un bajo aislado)")
 
