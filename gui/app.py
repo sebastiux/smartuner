@@ -172,30 +172,44 @@ class SmartunerApp:
         self.root.config(menu=menubar)
         self.root.bind_all("<Control-o>", lambda _e: self.open_audio())
 
-    def _build_layout(self) -> None:
-        from gui.tabs.audio_tab import AudioTab
-        from gui.tabs.compare_tab import CompareTab
-        from gui.tabs.config_tab import ConfigTab
-        from gui.tabs.live_tab import LiveTab
-        from gui.tabs.log_tab import LogTab
-        from gui.tabs.tablature_tab import TablatureTab
+    #: Pestañas: (clave, título, módulo, clase). El orden sigue el flujo de trabajo.
+    TAB_SPECS: tuple[tuple[str, str, str, str], ...] = (
+        ("audio", "1 · Audio", "gui.tabs.audio_tab", "AudioTab"),
+        ("config", "2 · Configuración", "gui.tabs.config_tab", "ConfigTab"),
+        ("live", "3 · Ejecución en vivo", "gui.tabs.live_tab", "LiveTab"),
+        ("tab", "4 · Tablatura", "gui.tabs.tablature_tab", "TablatureTab"),
+        ("compare", "5 · Comparación", "gui.tabs.compare_tab", "CompareTab"),
+        ("log", "6 · Log", "gui.tabs.log_tab", "LogTab"),
+    )
 
+    def _build_layout(self) -> None:
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(side="top", fill="both", expand=True)
         self.status = StatusBar(self.root, on_cancel=self.workers.cancel_all)
         self.status.pack(side="bottom", fill="x")
         self.tabs: dict[str, ttk.Frame] = {}
-        for key, title, cls in (
-            ("audio", "1 · Audio", AudioTab),
-            ("config", "2 · Configuración", ConfigTab),
-            ("live", "3 · Ejecución en vivo", LiveTab),
-            ("tab", "4 · Tablatura", TablatureTab),
-            ("compare", "5 · Comparación", CompareTab),
-            ("log", "6 · Log", LogTab),
-        ):
-            frame = cls(self.notebook, self)
-            self.notebook.add(frame, text=title)
-            self.tabs[key] = frame
+        for key, title, module_name, class_name in self.TAB_SPECS:
+            self.notebook.add(self._create_tab(module_name, class_name), text=title)
+            self.tabs[key] = self.notebook.nametowidget(self.notebook.tabs()[-1])
+
+    def _create_tab(self, module_name: str, class_name: str) -> ttk.Frame:
+        """Crea una pestaña; si falla, muestra el error en su lugar sin tumbar la aplicación."""
+        import importlib
+        import traceback
+
+        try:
+            cls = getattr(importlib.import_module(module_name), class_name)
+            return cls(self.notebook, self)
+        except Exception:  # noqa: BLE001 - una pestaña rota no debe impedir usar las demás
+            details = traceback.format_exc()
+            logger.error("No se pudo crear la pestaña %s:\n%s", class_name, details)
+            frame = ttk.Frame(self.notebook, padding=12)
+            ttk.Label(frame, text=f"Error al crear la pestaña {class_name}:", style="Header.TLabel").pack(anchor="w")
+            text = tk.Text(frame, height=20, wrap="word", foreground="#d03b3b")
+            text.insert("1.0", details)
+            text.configure(state="disabled")
+            text.pack(fill="both", expand=True)
+            return frame
 
     def show_tab(self, key: str) -> None:
         """Muestra la pestaña ``key`` (``"audio"``, ``"config"``, ``"live"``, ``"tab"``, ``"compare"``, ``"log"``)."""
