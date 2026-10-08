@@ -16,11 +16,13 @@ SR = 22050
 
 
 def _tone(freq: float, dur: float = 1.0, amp: float = 0.5, sr: int = SR) -> np.ndarray:
+    """Seno de ``freq`` Hz, ``dur`` s y amplitud ``amp`` (float32)."""
     t = np.arange(int(sr * dur)) / sr
     return (amp * np.sin(2 * np.pi * freq * t)).astype(np.float32)
 
 
 def _rms_db(y: np.ndarray) -> float:
+    """Nivel RMS de ``y`` en dB (0 dB = RMS 1)."""
     return 20.0 * np.log10(np.sqrt(np.mean(np.square(y, dtype=np.float64))))
 
 
@@ -38,10 +40,12 @@ def _attenuation_db(freq: float, cutoff: float = 400.0) -> float:
 
 
 def test_lowpass_attenuates_above_cutoff() -> None:
+    """El pasa-bajas de 400 Hz atenúa más de 20 dB un tono de 1500 Hz."""
     assert _attenuation_db(1500.0) > 20.0
 
 
 def test_lowpass_passes_below_cutoff() -> None:
+    """Un tono de 100 Hz (banda de paso) pasa con menos de 1 dB de cambio."""
     assert abs(_attenuation_db(100.0)) < 1.0
 
 
@@ -72,6 +76,7 @@ def test_lowpass_impulse_response_is_symmetric() -> None:
 
 @pytest.mark.parametrize("n", [22050, 12345, 7, 2, 1])
 def test_lowpass_preserves_length_and_dtype(n: int) -> None:
+    """El filtro conserva la longitud y el tipo float32, incluso en señales muy cortas."""
     y = np.random.default_rng(0).uniform(-1, 1, n).astype(np.float32)
     out = lowpass(y, SR, 400.0)
     assert out.shape == y.shape
@@ -79,6 +84,7 @@ def test_lowpass_preserves_length_and_dtype(n: int) -> None:
 
 
 def test_lowpass_above_nyquist_returns_copy() -> None:
+    """Un corte ≥ Nyquist no filtra: devuelve una copia idéntica."""
     y = _tone(3000.0)
     out = lowpass(y, SR, SR / 2)
     assert out is not y
@@ -86,6 +92,7 @@ def test_lowpass_above_nyquist_returns_copy() -> None:
 
 
 def test_lowpass_does_not_modify_input() -> None:
+    """El filtro no modifica el arreglo de entrada."""
     y = _tone(1500.0)
     original = y.copy()
     lowpass(y, SR, 400.0)
@@ -93,6 +100,7 @@ def test_lowpass_does_not_modify_input() -> None:
 
 
 def test_lowpass_rejects_invalid_cutoff() -> None:
+    """Un corte ≤ 0 Hz es un error."""
     with pytest.raises(ValueError):
         lowpass(_tone(100.0), SR, 0.0)
 
@@ -103,6 +111,7 @@ def test_lowpass_rejects_invalid_cutoff() -> None:
 
 
 def test_normalize_peak_sets_peak() -> None:
+    """normalize_peak lleva el pico a 0.99 aplicando solo una ganancia (sin deformar la onda ni tocar la entrada)."""
     y = np.array([0.1, -0.4, 0.2], dtype=np.float32)
     original = y.copy()
     out = normalize_peak(y)
@@ -114,11 +123,13 @@ def test_normalize_peak_sets_peak() -> None:
 
 
 def test_normalize_peak_custom_peak() -> None:
+    """normalize_peak acepta otro pico objetivo."""
     out = normalize_peak(_tone(55.0, amp=0.1), peak=0.5)
     assert np.max(np.abs(out)) == pytest.approx(0.5, abs=1e-6)
 
 
 def test_normalize_peak_null_signal_unchanged() -> None:
+    """Una señal nula (o vacía) no se normaliza: no hay división entre 0."""
     zeros = np.zeros(100, dtype=np.float32)
     out = normalize_peak(zeros)
     np.testing.assert_array_equal(out, zeros)
@@ -132,6 +143,7 @@ def test_normalize_peak_null_signal_unchanged() -> None:
 
 
 def test_preprocess_returns_two_aligned_signals() -> None:
+    """preprocess devuelve y_analysis (filtrada + normalizada) y y_spectral (solo normalizada, conserva armónicos agudos)."""
     low, high = _tone(55.0, amp=0.3), _tone(1500.0, amp=0.3)
     y = low + high
     res = preprocess(y, SR, PreprocessConfig(lowpass_hz=400.0, filter_order=4, normalize=True))
@@ -149,6 +161,7 @@ def test_preprocess_returns_two_aligned_signals() -> None:
 
 
 def test_preprocess_without_normalization() -> None:
+    """Con normalize=False ninguna señal se amplifica."""
     y = _tone(80.0, amp=0.2)
     res = preprocess(y, SR, PreprocessConfig(normalize=False))
     np.testing.assert_array_equal(res.y_spectral, y)
@@ -157,5 +170,6 @@ def test_preprocess_without_normalization() -> None:
 
 
 def test_doctests_pass() -> None:
+    """Los ejemplos de los docstrings de src.preprocessing se ejecutan sin fallos."""
     result = doctest.testmod(preprocessing)
     assert result.failed == 0

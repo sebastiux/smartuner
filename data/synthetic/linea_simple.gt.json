@@ -1,0 +1,135 @@
+{
+  "meta": {
+    "piece": "linea_simple",
+    "bpm": 100.0,
+    "sr": 22050,
+    "method": "fluidsynth",
+    "tuning": {
+      "E": 41.2,
+      "A": 55.0,
+      "D": 73.42,
+      "G": 98.0
+    },
+    "program": 33,
+    "program_name": "Electric Bass (finger)",
+    "soundfont": "FluidR3_GM.sf2",
+    "legato": 0.9,
+    "lead_in_s": 0.5,
+    "duration_s": 11.08,
+    "n_notes": 16
+  },
+  "notes": [
+    {
+      "onset_s": 0.5,
+      "offset_s": 1.04,
+      "midi": 33,
+      "string": "A",
+      "fret": 0
+    },
+    {
+      "onset_s": 1.1,
+      "offset_s": 1.64,
+      "midi": 37,
+      "string": "A",
+      "fret": 4
+    },
+    {
+      "onset_s": 1.7,
+      "offset_s": 2.24,
+      "midi": 40,
+      "string": "D",
+      "fret": 2
+    },
+    {
+      "onset_s": 2.3,
+      "offset_s": 2.84,
+      "midi": 37,
+      "string": "A",
+      "fret": 4
+    },
+    {
+      "onset_s": 2.9,
+      "offset_s": 3.44,
+      "midi": 38,
+      "string": "D",
+      "fret": 0
+    },
+    {
+      "onset_s": 3.5,
+      "offset_s": 4.04,
+      "midi": 42,
+      "string": "D",
+      "fret": 4
+    },
+    {
+      "onset_s": 4.1,
+      "offset_s": 4.64,
+      "midi": 45,
+      "string": "G",
+      "fret": 2
+    },
+    {
+      "onset_s": 4.7,
+      "offset_s": 5.24,
+      "midi": 42,
+      "string": "D",
+      "fret": 4
+    },
+    {
+      "onset_s": 5.3,
+      "offset_s": 5.84,
+      "midi": 28,
+      "string": "E",
+      "fret": 0
+    },
+    {
+      "onset_s": 5.9,
+      "offset_s": 6.44,
+      "midi": 32,
+      "string": "E",
+      "fret": 4
+    },
+    {
+      "onset_s": 6.5,
+      "offset_s": 7.04,
+      "midi": 35,
+      "string": "A",
+      "fret": 2
+    },
+    {
+      "onset_s": 7.1,
+      "offset_s": 7.64,
+      "midi": 32,
+      "string": "E",
+      "fret": 4
+    },
+    {
+      "onset_s": 7.7,
+      "offset_s": 8.24,
+      "midi": 33,
+      "string": "A",
+      "fret": 0
+    },
+    {
+      "onset_s": 8.3,
+      "offset_s": 8.84,
+      "midi": 37,
+      "string": "A",
+      "fret": 4
+    },
+    {
+      "onset_s": 8.9,
+      "offset_s": 9.44,
+      "midi": 40,
+      "string": "D",
+      "fret": 2
+    },
+    {
+      "onset_s": 9.5,
+      "offset_s": 10.58,
+      "midi": 33,
+      "string": "A",
+      "fret": 0
+    }
+  ]
+}

@@ -18,6 +18,7 @@ import sys
 import textwrap
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -85,38 +86,53 @@ FAKE_MAIN = textwrap.dedent(
 )
 
 
+@dataclass
+class FakeDemucs:
+    """Demucs falso instalado en ``root``: llamarlo construye el ``env`` del subproceso.
+
+    Attributes
+    ----------
+    root : Path
+        Carpeta que contiene el paquete ``demucs`` falso (se añade a PYTHONPATH).
+    log : Path
+        Archivo donde el Demucs falso registra cada invocación.
+    """
+
+    root: Path
+    log: Path
+
+    def __call__(self, mode: str = "ok", delay: float = 0.0) -> dict[str, str]:
+        """Variables de entorno para lanzar el Demucs falso en modo ``mode`` (ok, fail, hang, nooutput)."""
+        env = dict(os.environ)
+        env["PYTHONPATH"] = os.pathsep.join(p for p in (str(self.root), env.get("PYTHONPATH", "")) if p)
+        env["FAKE_DEMUCS_MODE"] = mode
+        env["FAKE_DEMUCS_DELAY"] = str(delay)
+        env["FAKE_DEMUCS_LOG"] = str(self.log)
+        return env
+
+
 @pytest.fixture()
-def fake_demucs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """Crea el paquete falso y devuelve una función que construye el ``env`` del subproceso."""
+def fake_demucs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeDemucs:
+    """Crea el paquete falso y devuelve el objeto que construye el ``env`` del subproceso."""
     root = tmp_path / "fake_site"
     pkg = root / "demucs"
     pkg.mkdir(parents=True)
     (pkg / "__init__.py").write_text('"""Paquete demucs falso."""\n', encoding="utf-8")
     (pkg / "__main__.py").write_text(FAKE_MAIN, encoding="utf-8")
-    log = tmp_path / "invocaciones.log"
     monkeypatch.setattr(separation, "demucs_available", lambda: True)
-
-    def make_env(mode: str = "ok", delay: float = 0.0) -> dict[str, str]:
-        env = dict(os.environ)
-        env["PYTHONPATH"] = os.pathsep.join(p for p in (str(root), env.get("PYTHONPATH", "")) if p)
-        env["FAKE_DEMUCS_MODE"] = mode
-        env["FAKE_DEMUCS_DELAY"] = str(delay)
-        env["FAKE_DEMUCS_LOG"] = str(log)
-        return env
-
-    make_env.log = log  # type: ignore[attr-defined]
-    make_env.root = root  # type: ignore[attr-defined]
-    return make_env
+    return FakeDemucs(root=root, log=tmp_path / "invocaciones.log")
 
 
 @pytest.fixture()
 def song(tmp_path: Path) -> Path:
+    """Archivo 'MP3' falso (bytes deterministas) con un punto en el nombre."""
     path = tmp_path / "mi.cancion.mp3"
     path.write_bytes(b"ID3" + bytes(range(256)) * 50)
     return path
 
 
 def _invocations(log: Path) -> list[str]:
+    """Líneas del registro de invocaciones del Demucs falso (vacío si nunca se ejecutó)."""
     return log.read_text(encoding="utf-8").splitlines() if log.exists() else []
 
 
@@ -126,6 +142,7 @@ def _invocations(log: Path) -> list[str]:
 
 
 def test_cache_key_is_deterministic_and_content_based(tmp_path: Path, song: Path) -> None:
+    """La clave de caché es un SHA-1 del CONTENIDO: no depende del nombre y cambia con un solo byte."""
     key = cache_key(song)
     assert key == cache_key(song)
     assert len(key) == 40 and all(c in "0123456789abcdef" for c in key)
@@ -144,11 +161,13 @@ def test_cache_key_is_deterministic_and_content_based(tmp_path: Path, song: Path
 
 
 def test_cache_key_depends_on_model(song: Path) -> None:
+    """La clave de caché incluye el modelo de Demucs (htdemucs ≠ htdemucs_ft)."""
     assert cache_key(song, "htdemucs") != cache_key(song, "htdemucs_ft")
     assert cache_key(song) == cache_key(song, "htdemucs")
 
 
 def test_cache_key_reads_large_files_in_blocks(tmp_path: Path) -> None:
+    """Archivos grandes se leen por bloques y dan el mismo SHA-1 que el contenido completo."""
     import hashlib
 
     big = tmp_path / "grande.wav"
@@ -158,6 +177,7 @@ def test_cache_key_reads_large_files_in_blocks(tmp_path: Path) -> None:
 
 
 def test_cached_stem_path(tmp_path: Path, song: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """cached_stem_path solo calcula la ruta <caché>/<clave>_bass.wav (no crea carpetas) y usa CACHE_DIR por defecto."""
     explicit = cached_stem_path(song, cache_dir=tmp_path / "c")
     assert explicit == tmp_path / "c" / f"{cache_key(song)}_bass.wav"
     assert not explicit.parent.exists()  # solo calcula la ruta
@@ -172,6 +192,7 @@ def test_cached_stem_path(tmp_path: Path, song: Path, monkeypatch: pytest.Monkey
 
 
 def test_demucs_available_does_not_import(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """demucs_available() busca el paquete sin importarlo (importar PyTorch tardaría segundos)."""
     if importlib.util.find_spec("demucs") is None:
         assert demucs_available() is False
     pkg = tmp_path / "site" / "demucs"
@@ -183,6 +204,7 @@ def test_demucs_available_does_not_import(tmp_path: Path, monkeypatch: pytest.Mo
 
 
 def test_demucs_command() -> None:
+    """El comando lanza ``python -m demucs --two-stems bass -n <modelo> -o <salida> <pista>`` con argumentos de texto."""
     cmd = _demucs_command("musica/mezcla.mp3", "htdemucs", "/tmp/salida")
     assert cmd[:3] == [sys.executable, "-m", "demucs"]
     assert cmd[cmd.index("--two-stems") + 1] == "bass"
@@ -204,6 +226,7 @@ def test_demucs_command() -> None:
     ],
 )
 def test_parse_percent(text: str, expected: float | None) -> None:
+    """_parse_percent extrae el último porcentaje de una línea de tqdm (o None)."""
     assert _parse_percent(text) == expected
 
 
@@ -215,12 +238,14 @@ def test_parse_percent(text: str, expected: float | None) -> None:
 def test_returns_cache_without_running_anything(
     tmp_path: Path, song: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
+    """Si el stem ya está en caché se devuelve sin lanzar Demucs (progreso 100 % y aviso en el log)."""
     cache = tmp_path / "cache"
     stem = cached_stem_path(song, cache_dir=cache)
     stem.parent.mkdir(parents=True)
     stem.write_bytes(b"stem guardado")
 
     def forbidden(*args: object, **kwargs: object) -> None:
+        """Sustituto de Popen que falla si se intenta lanzar Demucs."""
         raise AssertionError("no debe ejecutarse Demucs si hay caché")
 
     monkeypatch.setattr(separation.subprocess, "Popen", forbidden)
@@ -235,6 +260,7 @@ def test_returns_cache_without_running_anything(
 
 
 def test_missing_demucs_raises_helpful_error(tmp_path: Path, song: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Sin Demucs instalado, SeparationError explica cómo instalarlo (requirements-optional.txt, PyTorch)."""
     monkeypatch.setattr(separation, "demucs_available", lambda: False)
     with pytest.raises(SeparationError) as info:
         separate_bass(song, cache_dir=tmp_path / "cache")
@@ -245,11 +271,13 @@ def test_missing_demucs_raises_helpful_error(tmp_path: Path, song: Path, monkeyp
 
 
 def test_missing_input_file_raises(tmp_path: Path) -> None:
+    """Un archivo de entrada inexistente es SeparationError con mensaje en español."""
     with pytest.raises(SeparationError, match="No existe"):
         separate_bass(tmp_path / "no_existe.mp3", cache_dir=tmp_path / "cache")
 
 
-def test_end_to_end_with_fake_demucs(tmp_path: Path, song: Path, fake_demucs) -> None:
+def test_end_to_end_with_fake_demucs(tmp_path: Path, song: Path, fake_demucs: FakeDemucs) -> None:
+    """De extremo a extremo con el Demucs falso: stem en caché, carpeta temporal borrada, progreso leído de tqdm y caché reutilizada."""
     cache = tmp_path / "cache"
     calls: list[tuple[float, str]] = []
     result = separate_bass(
@@ -286,7 +314,7 @@ def test_end_to_end_with_fake_demucs(tmp_path: Path, song: Path, fake_demucs) ->
     assert len(_invocations(fake_demucs.log)) == 2
 
 
-def test_progress_is_incremental(tmp_path: Path, song: Path, fake_demucs) -> None:
+def test_progress_is_incremental(tmp_path: Path, song: Path, fake_demucs: FakeDemucs) -> None:
     """Cada porcentaje llega mientras Demucs sigue trabajando, no todos al final."""
     arrivals: list[tuple[float, float]] = []
     start = time.monotonic()
@@ -301,11 +329,13 @@ def test_progress_is_incremental(tmp_path: Path, song: Path, fake_demucs) -> Non
     assert t100 - t25 > 0.5  # 25 % se notificó bastante antes de terminar
 
 
-def test_cancellation_kills_process(tmp_path: Path, song: Path, fake_demucs) -> None:
+def test_cancellation_kills_process(tmp_path: Path, song: Path, fake_demucs: FakeDemucs) -> None:
+    """Cancelar durante Demucs mata el proceso enseguida y lanza SeparationCancelledError (también CancelledError)."""
     cache = tmp_path / "cache"
     cancel = threading.Event()
 
     def on_progress(fraction: float, message: str) -> None:
+        """Callback que simula al usuario pulsando «Cancelar» en cuanto ve progreso."""
         if fraction >= 0.25:  # el usuario pulsa "Cancelar" en cuanto ve progreso
             cancel.set()
 
@@ -327,7 +357,8 @@ def test_cancellation_kills_process(tmp_path: Path, song: Path, fake_demucs) -> 
             os.kill(pid, 0)
 
 
-def test_cancel_before_start_does_not_launch(tmp_path: Path, song: Path, fake_demucs) -> None:
+def test_cancel_before_start_does_not_launch(tmp_path: Path, song: Path, fake_demucs: FakeDemucs) -> None:
+    """Con ``cancel`` ya activo no se lanza Demucs."""
     cancel = threading.Event()
     cancel.set()
     with pytest.raises(CancelledError):
@@ -335,7 +366,8 @@ def test_cancel_before_start_does_not_launch(tmp_path: Path, song: Path, fake_de
     assert _invocations(fake_demucs.log) == []
 
 
-def test_nonzero_exit_raises_with_output_tail(tmp_path: Path, song: Path, fake_demucs) -> None:
+def test_nonzero_exit_raises_with_output_tail(tmp_path: Path, song: Path, fake_demucs: FakeDemucs) -> None:
+    """Si Demucs termina con error, el mensaje incluye el código de salida y el final de su salida; la caché queda limpia."""
     cache = tmp_path / "cache"
     with pytest.raises(SeparationError) as info:
         separate_bass(song, cache_dir=cache, env=fake_demucs(mode="fail"))
@@ -346,7 +378,8 @@ def test_nonzero_exit_raises_with_output_tail(tmp_path: Path, song: Path, fake_d
     assert list(cache.iterdir()) == []
 
 
-def test_missing_stem_raises(tmp_path: Path, song: Path, fake_demucs) -> None:
+def test_missing_stem_raises(tmp_path: Path, song: Path, fake_demucs: FakeDemucs) -> None:
+    """Si Demucs termina sin escribir bass.wav se lanza SeparationError y la caché queda limpia."""
     cache = tmp_path / "cache"
     with pytest.raises(SeparationError, match="sin generar"):
         separate_bass(song, cache_dir=cache, env=fake_demucs(mode="nooutput"))
@@ -354,4 +387,5 @@ def test_missing_stem_raises(tmp_path: Path, song: Path, fake_demucs) -> None:
 
 
 def test_doctests_pass() -> None:
+    """Los ejemplos de los docstrings de src.separation se ejecutan sin fallos."""
     assert doctest.testmod(separation).failed == 0

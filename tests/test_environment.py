@@ -24,6 +24,7 @@ from src.environment import (
     fret_frequency,
     next_hand_fret,
     playability_penalty,
+    stft_max_frequency,
 )
 from src.segmentation import Segment
 
@@ -31,6 +32,7 @@ SR = 22050
 
 
 def _tone(f0: float, dur: float = 2.0, amps: tuple[float, ...] = (1.0, 0.8, 0.5, 0.35, 0.25)) -> np.ndarray:
+    """Tono armónico Σ_h a_h·sin(2π·h·f0·t) normalizado a pico 0.5 (float32)."""
     t = np.arange(int(SR * dur)) / SR
     y = sum(a * np.sin(2 * np.pi * (h + 1) * f0 * t) for h, a in enumerate(amps))
     return (0.5 * y / np.max(np.abs(y))).astype(np.float32)
@@ -38,12 +40,14 @@ def _tone(f0: float, dur: float = 2.0, amps: tuple[float, ...] = (1.0, 0.8, 0.5,
 
 def _segment(start: float = 0.0, end: float = 1.0, f0: float | None = 55.0, index: int = 0,
              kept: bool = True) -> Segment:
+    """Segmento mínimo de ``start`` a ``end`` segundos con f0 opcional (conservado o descartado)."""
     return Segment(index=index, start_s=start, end_s=end, start_sample=int(start * SR),
                    end_sample=int(end * SR), rms_db=-6.0, kept=kept, reason="ok" if kept else "silencio",
                    f0_hz=f0, voiced_ratio=1.0 if f0 else 0.0)
 
 
 def _data(arms: list[Arm], sal: np.ndarray, position: int = 0) -> SegmentBanditData:
+    """SegmentBanditData con la matriz de saliencia ``sal`` dada a mano (frames × brazos)."""
     return SegmentBanditData(segment=_segment(), position=position, arms=arms,
                              frame_indices=np.arange(sal.shape[0]), salience=np.asarray(sal, dtype=float))
 
@@ -55,6 +59,7 @@ def a1_spectrum() -> Spectrum:
 
 
 def test_module_doctests() -> None:
+    """Los ejemplos de los docstrings de src.environment se ejecutan sin fallos."""
     result = doctest.testmod(environment)
     assert result.failed == 0 and result.attempted > 0
 
@@ -65,6 +70,7 @@ def test_module_doctests() -> None:
 
 
 def test_fret_frequency_formula() -> None:
+    """f(cuerda, traste) = f_cuerda·2^(traste/12): un traste = un semitono, 12 trastes = una octava."""
     assert fret_frequency("A", 0) == pytest.approx(55.0)
     assert fret_frequency("E", 5) == pytest.approx(55.0, abs=0.01)
     assert fret_frequency("G", 12) == pytest.approx(196.0)
@@ -74,6 +80,7 @@ def test_fret_frequency_formula() -> None:
 
 
 def test_arm_properties() -> None:
+    """Etiqueta 'D-3', MIDI = MIDI de la cuerda al aire + traste e índice de cuerda de grave a aguda."""
     arm = Arm("D", 3)
     assert arm.label == "D-3"
     assert arm.midi == 41
@@ -82,6 +89,7 @@ def test_arm_properties() -> None:
 
 
 def test_all_arms_count_and_order() -> None:
+    """4 cuerdas × 13 trastes = 52 brazos únicos, ordenados por cuerda (E, A, D, G) y traste."""
     arms = all_arms()
     assert len(arms) == 52
     assert len(set(arms)) == 52
@@ -93,12 +101,14 @@ def test_all_arms_count_and_order() -> None:
 
 
 def test_candidate_arms_k0_same_pitch_positions() -> None:
+    """Con k = 0 solo quedan las posiciones del mismo pitch (A1: E-5 y A-0), ordenadas por cuerda."""
     arms = candidate_arms(55.0, 0)
     assert {a.label for a in arms} == {"A-0", "E-5"}
     assert [a.label for a in arms] == ["E-5", "A-0"]  # mismo MIDI → orden por cuerda (E antes que A)
 
 
 def test_candidate_arms_k2_midis_and_order() -> None:
+    """Con k = 2 quedan TODAS las posiciones a ±2 semitonos de la f0, ordenadas por (MIDI, cuerda)."""
     arms = candidate_arms(55.0, 2)
     assert {a.midi for a in arms} == {31, 32, 33, 34, 35}
     keys = [(a.midi, a.string_index) for a in arms]
@@ -116,10 +126,12 @@ def test_candidate_arms_uses_nearest_semitone() -> None:
 
 @pytest.mark.parametrize("f0, k", [(55.0, None), (None, 2), (None, None), (2000.0, 2), (10.0, 0)])
 def test_candidate_arms_falls_back_to_all(f0: float | None, k: int | None) -> None:
+    """Sin f0, sin poda (k = None) o con f0 fuera del rango del bajo se usan los 52 brazos."""
     assert len(candidate_arms(f0, k)) == 52
 
 
 def test_candidate_arms_rejects_negative_k() -> None:
+    """Un radio de poda negativo es un error."""
     with pytest.raises(ValueError):
         candidate_arms(55.0, -1)
 
@@ -130,6 +142,7 @@ def test_candidate_arms_rejects_negative_k() -> None:
 
 
 def test_playability_penalty_values() -> None:
+    """Penalización λ·|traste − traste_previo|/12: valores a mano; 0 sin posición previa o con λ = 0."""
     pen = playability_penalty(np.array([0, 5, 7, 12]), 5, 0.12)
     np.testing.assert_allclose(pen, [0.05, 0.0, 0.02, 0.07])
     np.testing.assert_array_equal(playability_penalty(np.array([0, 5, 7]), None, 0.12), 0.0)
@@ -137,6 +150,7 @@ def test_playability_penalty_values() -> None:
 
 
 def test_open_string_free_removes_penalty_and_keeps_hand() -> None:
+    """Con open_string_free la cuerda al aire no penaliza y no mueve la mano; sin la opción, la mano va al traste 0."""
     arms = [Arm("A", 0), Arm("E", 5), Arm("D", 2)]
     data = _data(arms, np.full((4, 3), 0.5))
     rng = np.random.default_rng(0)
@@ -154,6 +168,7 @@ def test_open_string_free_removes_penalty_and_keeps_hand() -> None:
 
 
 def test_from_config_reads_parameters() -> None:
+    """BanditEnvironment.from_config toma λ, el ruido σ y open_string_free de EnvConfig."""
     data = _data([Arm("A", 0), Arm("E", 5)], np.full((3, 2), 0.5))
     cfg = EnvConfig(lam=0.24, noise_std=0.05, open_string_free=True)
     env = BanditEnvironment.from_config(data, 5, cfg, np.random.default_rng(0))
@@ -167,6 +182,7 @@ def test_from_config_reads_parameters() -> None:
 
 
 def _random_env(seed: int = 1, noise_std: float = 0.0, prev_fret: int | None = 3) -> BanditEnvironment:
+    """Entorno de 5 brazos con saliencia aleatoria (40 frames), λ = 0.3 y semilla ``seed``."""
     rng = np.random.default_rng(100 + seed)
     arms = [Arm("E", 3), Arm("A", 0), Arm("A", 2), Arm("D", 1), Arm("E", 7)]
     sal = rng.random((40, len(arms)))
@@ -175,6 +191,7 @@ def _random_env(seed: int = 1, noise_std: float = 0.0, prev_fret: int | None = 3
 
 
 def test_true_means_are_mean_salience_minus_penalty() -> None:
+    """μ_a = media de la saliencia sobre los frames − penalización (exacto, sin simular) y μ* = max μ."""
     env = _random_env()
     np.testing.assert_allclose(env.true_means, env.data.salience.mean(axis=0) - env.penalties)
     assert env.best_mean == pytest.approx(env.true_means.max())
@@ -205,6 +222,7 @@ def test_same_seed_same_frame_sequence_for_any_arm() -> None:
 
 
 def test_pull_and_pull_detailed_consume_rng_identically() -> None:
+    """pull y pull_detailed consumen el generador igual: misma recompensa, con frame, saliencia, penalización y ruido coherentes."""
     env_fast = _random_env(seed=9, noise_std=0.1)
     env_slow = _random_env(seed=9, noise_std=0.1)
     for t in range(100):
@@ -220,6 +238,7 @@ def test_pull_and_pull_detailed_consume_rng_identically() -> None:
 
 
 def test_no_noise_means_reward_is_salience_minus_penalty() -> None:
+    """Sin ruido extra la recompensa es exactamente S_j(f_a) − penalización."""
     env = _random_env(seed=2)
     for _ in range(50):
         res = env.pull_detailed(1)
@@ -228,6 +247,7 @@ def test_no_noise_means_reward_is_salience_minus_penalty() -> None:
 
 
 def test_regret_nonnegative_and_zero_for_optimal() -> None:
+    """El regret Δ_a = μ* − μ_a es ≥ 0 y vale 0 exactamente en los brazos óptimos."""
     env = _random_env(seed=5)
     regrets = np.array([env.regret_of(a) for a in range(env.n_arms)])
     assert np.all(regrets >= 0)
@@ -238,6 +258,7 @@ def test_regret_nonnegative_and_zero_for_optimal() -> None:
 
 
 def test_optimal_arms_include_exact_ties() -> None:
+    """Brazos con μ empatado son todos óptimos (regret 0); el resto tiene Δ > 0."""
     sal = np.array([[0.5, 0.5, 0.2], [0.7, 0.7, 0.9]])
     env = BanditEnvironment(_data([Arm("A", 0), Arm("A", 0), Arm("D", 0)], sal), None, 0.1,
                             np.random.default_rng(0))
@@ -247,6 +268,7 @@ def test_optimal_arms_include_exact_ties() -> None:
 
 
 def test_invalid_arm_index_raises() -> None:
+    """Jalar un brazo fuera de 0..K−1 lanza IndexError (no se indexa en silencio)."""
     env = _random_env()
     with pytest.raises(IndexError):
         env.pull(env.n_arms)
@@ -269,11 +291,38 @@ def test_same_pitch_optimum_is_least_movement_real_spectrum(a1_spectrum: Spectru
     data = build_segment_data(a1_spectrum, _segment(0.3, 1.7, 55.0), 0, EnvConfig(k_semitones=0))
     labels = [a.label for a in data.arms]
     assert labels == ["E-5", "A-0"]
-    # Saliencias prácticamente idénticas: el espectro no distingue la cuerda.
-    assert abs(data.mean_salience[0] - data.mean_salience[1]) < 0.01
+    # Saliencias IDÉNTICAS (se calculan una vez por pitch): el espectro no distingue la cuerda.
+    np.testing.assert_array_equal(data.salience[:, 0], data.salience[:, 1])
     for prev, best in ((5, "E-5"), (7, "E-5"), (0, "A-0"), (1, "A-0")):
         env = BanditEnvironment(data, prev, 0.1, np.random.default_rng(0))
         assert [labels[i] for i in env.optimal_arms] == [best]
+
+
+def test_same_pitch_twins_tie_exactly_without_penalty(a1_spectrum: Spectrum) -> None:
+    """Regresión: con λ = 0 (o penalizaciones iguales) las posiciones gemelas son TODAS óptimas.
+
+    Antes la saliencia se calculaba con la frecuencia de cada cuerda (55.0 Hz
+    frente a 54.995 Hz por el redondeo de OPEN_STRING_HZ) y las gemelas
+    diferían en ~10⁻⁴: siempre había un único óptimo, decidido por un
+    artefacto numérico.
+    """
+    data = build_segment_data(a1_spectrum, _segment(0.3, 1.7, 55.0), 0, EnvConfig(k_semitones=None))
+    by_midi: dict[int, list[int]] = {}
+    for i, arm in enumerate(data.arms):
+        by_midi.setdefault(arm.midi, []).append(i)
+    for idx in by_midi.values():
+        for i in idx[1:]:
+            np.testing.assert_array_equal(data.salience[:, i], data.salience[:, idx[0]])
+    env = BanditEnvironment(data, 3, 0.0, np.random.default_rng(0))
+    assert sorted(data.arms[i].label for i in env.optimal_arms) == ["A-0", "E-5"]
+    assert env.gaps[env.optimal_arms].tolist() == [0.0, 0.0]
+    # Sin posición previa de la mano no hay penalización: las gemelas vuelven a empatar.
+    env_none = BanditEnvironment(data, None, 0.1, np.random.default_rng(0))
+    assert sorted(data.arms[i].label for i in env_none.optimal_arms) == ["A-0", "E-5"]
+    # Penalizaciones iguales también empatan: D2 en E-10 y en D-0 con la mano en el traste 5.
+    env_5 = BanditEnvironment(data, 5, 0.1, np.random.default_rng(0))
+    labels = [a.label for a in data.arms]
+    assert env_5.true_means[labels.index("E-10")] == env_5.true_means[labels.index("D-0")]
 
 
 # ---------------------------------------------------------------------------
@@ -282,8 +331,9 @@ def test_same_pitch_optimum_is_least_movement_real_spectrum(a1_spectrum: Spectru
 
 
 def test_compute_spectrum_cqt_peak_near_f0() -> None:
+    """La CQT tiene bins logarítmicos crecientes desde cqt_fmin, hop de 256 muestras y su pico a < ½ semitono de la f0."""
     f0 = 98.0
-    cfg = EnvConfig()
+    cfg = EnvConfig(spectrum="cqt")
     y = _tone(f0, amps=(1.0, 0.3, 0.1))
     spec = compute_spectrum(y, SR, cfg)
     assert spec.kind == "cqt" and spec.sr == SR and spec.hop_length == 256
@@ -298,13 +348,17 @@ def test_compute_spectrum_cqt_peak_near_f0() -> None:
 
 
 def test_compute_spectrum_stft() -> None:
+    """La STFT guarda solo la banda útil (hasta stft_max_frequency), con bins de sr/n_fft Hz y el pico en la f0."""
     f0 = 110.0
     cfg = EnvConfig(spectrum="stft", n_fft=4096)
     spec = compute_spectrum(_tone(f0, amps=(1.0, 0.3)), SR, cfg, hop_length=512)
     assert spec.kind == "stft" and spec.hop_length == 512
     assert spec.mag.dtype == np.float32
-    assert spec.mag.shape[0] == 4096 // 2 + 1 == spec.freqs_hz.size
+    # Solo se guarda la banda que lee la recompensa (hasta ≈ 1.2 kHz, no hasta sr/2).
+    assert spec.mag.shape[0] == spec.freqs_hz.size < 4096 // 2 + 1
     assert spec.freqs_hz[0] == 0.0
+    assert spec.freqs_hz[-1] >= stft_max_frequency(cfg) > spec.freqs_hz[-2]
+    np.testing.assert_allclose(np.diff(spec.freqs_hz), SR / 4096)
     peak_hz = spec.freqs_hz[np.argmax(spec.mag[:, spec.mag.shape[1] // 2])]
     assert abs(peak_hz - f0) <= SR / 4096
     # La saliencia funciona igual sobre el eje lineal de la STFT.
@@ -313,6 +367,7 @@ def test_compute_spectrum_stft() -> None:
 
 
 def test_compute_spectrum_rejects_unknown_kind() -> None:
+    """Un tipo de espectro desconocido ('mel') es un error."""
     with pytest.raises(ValueError):
         compute_spectrum(_tone(55.0, dur=0.5), SR, EnvConfig(spectrum="mel"))
 
@@ -332,6 +387,7 @@ def _toy_spectrum(n_frames: int = 100, hop_s: float = 0.01) -> Spectrum:
 
 
 def test_build_segment_data_skips_attack() -> None:
+    """build_segment_data salta los primeros attack_skip_s de la nota y poda a ±k semitonos; el mejor brazo tiene el pitch correcto."""
     spec = _toy_spectrum()
     cfg = EnvConfig(attack_skip_s=0.03, k_semitones=2)
     data = build_segment_data(spec, _segment(0.195, 0.495, 55.0), 3, cfg)
@@ -345,6 +401,7 @@ def test_build_segment_data_skips_attack() -> None:
 
 
 def test_build_segment_data_frame_fallbacks() -> None:
+    """Notas más cortas que el ataque usan [inicio, fin) y, si no hay frames dentro, el frame más cercano al centro."""
     spec = _toy_spectrum()
     cfg = EnvConfig(attack_skip_s=0.03)
     # Segmento más corto que el ataque: se usan los frames de [inicio, fin).
@@ -357,12 +414,14 @@ def test_build_segment_data_frame_fallbacks() -> None:
 
 
 def test_build_segment_data_unknown_f0_uses_all_arms() -> None:
+    """Sin f0 (pYIN no detectó voz) no se poda: el segmento tiene los 52 brazos."""
     data = build_segment_data(_toy_spectrum(), _segment(0.1, 0.5, None), 0, EnvConfig())
     assert data.n_arms == 52
     assert data.arms == all_arms()
 
 
 def test_build_segment_data_logs_summary(caplog: pytest.LogCaptureFixture) -> None:
+    """El log INFO de cada segmento dice f0, brazos candidatos y el brazo de mayor saliencia media."""
     with caplog.at_level(logging.INFO, logger="src.environment"):
         build_segment_data(_toy_spectrum(), _segment(0.1, 0.5, 55.0), 7, EnvConfig(k_semitones=0))
     msg = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("Segmento 7"))
@@ -372,6 +431,7 @@ def test_build_segment_data_logs_summary(caplog: pytest.LogCaptureFixture) -> No
 
 
 def test_build_all_segment_data_only_kept_consecutive_positions() -> None:
+    """Solo los segmentos conservados generan datos bandit, con posiciones consecutivas 0, 1, 2..."""
     spec = _toy_spectrum()
     segments = [
         _segment(0.00, 0.20, 55.0, index=0),

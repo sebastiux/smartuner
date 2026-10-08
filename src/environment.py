@@ -36,7 +36,11 @@ Al jalar el brazo a se elige un frame j al azar del segmento y se calcula::
     r        = S_j(f_a) − λ·|traste_a − traste_previo|/12 (+ ruido opcional)
 
 con h = 1..N y w_h = 1/h. X̃(x) se lee como el máximo de la magnitud
-interpolada dentro de ±``tolerance_semitones`` alrededor de x.
+interpolada dentro de ±``tolerance_semitones`` alrededor de x (máximo exacto
+de la interpolación lineal en la ventana, ver :func:`salience_components`).
+La saliencia depende solo del PITCH del brazo: se calcula una vez por nota
+MIDI m con la frecuencia temperada f(m) = 440·2^((m − 69)/12) Hz y se copia
+a todas las posiciones (cuerda, traste) que tocan esa nota.
 
 **Template armónico.** Una cuerda pulsada vibra a la vez en su fundamental f
 y en sus múltiplos 2f, 3f, 4f... (serie armónica). La "huella" de una nota en
@@ -44,8 +48,9 @@ el espectro es, por tanto, un peine de picos en h·f. La saliencia S⁺ mide
 cuánto encaja el espectro observado con el peine de cada candidato
 (*suma armónica*, Klapuri 2006). Los pesos w_h = 1/h dan más importancia a
 los armónicos graves, que en el bajo son los más fuertes y fiables, y
-favorecen al candidato más grave que explica el peine. Como Σ w_h = 1 y
-0 ≤ X̃ ≤ 1, S⁺ es una media ponderada y queda en [0, 1].
+favorecen al candidato más grave que explica el peine. Como se divide entre
+Σ_h w_h (los pesos normalizados w_h/Σ_k w_k suman 1) y 0 ≤ X̃ ≤ 1, S⁺ es una
+media ponderada y queda en [0, 1].
 
 **¿Por qué β castiga los errores de octava?** El candidato una octava arriba,
 2f₀, tiene armónicos {2f₀, 4f₀, 6f₀, ...}: todos son armónicos REALES de la
@@ -73,12 +78,16 @@ simulación. El agente NUNCA ve μ (solo muestras r); μ se usa como "oráculo"
 para medir el regret μ* − μ_{a_t} y el % de veces que se eligió el óptimo.
 
 **¿Qué distingue posiciones con el mismo pitch?** A-0 y E-5 suenan a la misma
-frecuencia (55.00 Hz y 41.20·2^(5/12) ≈ 54.995 Hz), así que tienen el mismo
-template armónico y —en cada frame— prácticamente la misma saliencia: el
-espectro no "sabe" en qué cuerda se tocó la nota. La única diferencia entre
-sus μ es la penalización de tocabilidad λ·|Δtraste|/12, que favorece la
-posición que exige MENOS movimiento de la mano respecto al traste previo.
-Con λ = 0 esas posiciones quedan (casi) empatadas.
+nota (A1, MIDI 33): el espectro no "sabe" en qué cuerda se tocó. Por eso su
+saliencia se calcula UNA vez, con la frecuencia temperada de la nota
+(55.00 Hz), y es idéntica en cada frame. Calcularla con la frecuencia de cada
+cuerda (55.00 Hz frente a 41.20·2^(5/12) ≈ 54.995 Hz, por el redondeo de
+:data:`src.config.OPEN_STRING_HZ`) daría diferencias de ~10⁻⁴ que no son
+música sino artefactos numéricos, y decidirían el desempate. Así, la única
+diferencia entre sus μ es la penalización de tocabilidad λ·|Δtraste|/12, que
+favorece la posición que exige MENOS movimiento de la mano respecto al traste
+previo; con λ = 0 esas posiciones quedan EXACTAMENTE empatadas (todas son
+óptimas y el oráculo aplica su regla de desempate).
 
 Eficiencia y números aleatorios comunes
 ---------------------------------------
@@ -101,14 +110,10 @@ from dataclasses import dataclass
 import numpy as np
 
 from src.config import OPEN_STRING_HZ, OPEN_STRING_MIDI, STRING_ORDER, EnvConfig
-from src.pitch import hz_to_midi
+from src.pitch import hz_to_midi, midi_to_hz, segment_log_name
 from src.segmentation import Segment
 
 logger = logging.getLogger(__name__)
-
-#: Número de puntos uniformes (en semitonos) con que se explora la ventana de
-#: tolerancia ±``tolerance_semitones`` al leer X̃ en cada posición armónica.
-N_TOLERANCE_POINTS: int = 5
 
 #: Un frame cuyo máximo de magnitud no supera este valor se considera
 #: silencioso: no se normaliza (evita dividir entre ~0) y su saliencia es 0.
@@ -308,7 +313,7 @@ class Spectrum:
     hop_length : int
         Salto entre frames en muestras.
     sr : int
-        Frecuencia de muestreo.
+        Frecuencia de muestreo en Hz.
     kind : str
         ``"cqt"`` o ``"stft"``.
     """
@@ -319,6 +324,33 @@ class Spectrum:
     hop_length: int
     sr: int
     kind: str
+
+
+def stft_max_frequency(cfg: EnvConfig) -> float:
+    """Frecuencia más alta (Hz) de la STFT que se guarda para la recompensa.
+
+    f_lím = (N + 1) · f(G, n_frets) · 2^(tol/12): el armónico N de la nota
+    más aguda del diapasón, más el extremo superior de su ventana de
+    tolerancia y un armónico de holgura (la gráfica del template muestra
+    hasta (N + 0.6)·f).
+
+    Parameters
+    ----------
+    cfg : EnvConfig
+        Usa ``n_harmonics``, ``n_frets`` y ``tolerance_semitones`` (semitonos).
+
+    Returns
+    -------
+    float
+        Frecuencia límite en Hz.
+
+    Examples
+    --------
+    >>> round(stft_max_frequency(EnvConfig()), 1)      # (5 + 1) · 196 Hz · 2^(0.33/12)
+    1198.6
+    """
+    f_top = fret_frequency(STRING_ORDER[-1], int(cfg.n_frets))
+    return float((int(cfg.n_harmonics) + 1) * f_top * 2.0 ** (max(float(cfg.tolerance_semitones), 0.0) / 12.0))
 
 
 def compute_spectrum(y: np.ndarray, sr: int, cfg: EnvConfig, hop_length: int = 256) -> Spectrum:
@@ -333,7 +365,8 @@ def compute_spectrum(y: np.ndarray, sr: int, cfg: EnvConfig, hop_length: int = 2
         Frecuencia de muestreo en Hz.
     cfg : EnvConfig
         Usa ``spectrum``, ``cqt_fmin_hz``, ``n_octaves``, ``bins_per_octave`` y
-        ``n_fft``.
+        ``n_fft`` (y, con la STFT, ``n_harmonics``, ``n_frets`` y
+        ``tolerance_semitones`` para recortar la banda guardada).
     hop_length : int
         Salto entre frames en muestras (256 ≈ 11.6 ms a 22 050 Hz).
 
@@ -354,12 +387,28 @@ def compute_spectrum(y: np.ndarray, sr: int, cfg: EnvConfig, hop_length: int = 2
       logarítmicamente, ``bins_per_octave`` por octava (36 = un tercio de
       semitono), igual que las notas musicales. Cada armónico h·f cae siempre
       en la misma posición relativa del eje, sea cual sea la nota.
-    * **STFT**: bins espaciados linealmente cada sr/n_fft Hz (≈ 5.4 Hz con
-      n_fft = 4096); en el registro grave del bajo (41–200 Hz) un semitono
-      ocupa solo 0.5–2 bins.
+    * **STFT**: bins espaciados linealmente cada sr/n_fft Hz (≈ 2.7 Hz con
+      n_fft = 8192, el valor por defecto); en el registro grave del bajo
+      (41–200 Hz) un semitono ocupa solo 1–4 bins, pero los armónicos
+      superiores sí se separan bien (en 5·f un semitono es 5 veces más
+      ancho en Hz). Su ventana es la MISMA para todas las frecuencias
+      (8192 muestras ≈ 0.37 s, ancho efectivo de la Hann ≈ 0.19 s).
+
+    **¿Por qué STFT por defecto?** La CQT con 36 bins/octava necesita
+    ventanas de ≈ 1.2 s en 41 Hz (Q ≈ 51): en el grave mezcla la nota con
+    sus vecinas y, en notas rápidas, el pitch de la nota siguiente "contamina"
+    la saliencia (p. ej. E-0 seguido de E-1 en ``cromatica``: el oráculo elegía
+    E-1). Ver la comparación numérica en :class:`src.config.EnvConfig`.
 
     La saliencia lee el espectro interpolando sobre log2(frecuencia), así
     que sirve para ambas representaciones sin cambios.
+
+    **Banda guardada (STFT).** La STFT completa llega hasta sr/2 = 11 025 Hz,
+    pero la recompensa solo lee hasta N·f_máx·2^(tol/12) ≈ 1 kHz (ver
+    :func:`stft_max_frequency`); se guardan solo esos bins. Consecuencia: la
+    normalización por frame X̃ = |X|/max|X| usa el máximo DENTRO de esa
+    banda, que en el bajo es el de la fundamental o los primeros armónicos
+    (ruido o clics por encima de ≈ 1 kHz ya no cambian la escala).
     """
     import librosa  # import diferido: librosa tarda en cargarse
 
@@ -380,10 +429,17 @@ def compute_spectrum(y: np.ndarray, sr: int, cfg: EnvConfig, hop_length: int = 2
         freqs = librosa.cqt_frequencies(n_bins=n_bins, fmin=cfg.cqt_fmin_hz,
                                         bins_per_octave=cfg.bins_per_octave)
     else:
-        mag = np.abs(librosa.stft(y=y, n_fft=cfg.n_fft, hop_length=hop_length))
+        stft = librosa.stft(y=y, n_fft=cfg.n_fft, hop_length=hop_length)
         freqs = librosa.fft_frequencies(sr=sr, n_fft=cfg.n_fft)
+        # Solo se guardan los bins que puede leer la recompensa (hasta f_lím, más
+        # uno para interpolar en el borde): con n_fft = 8192 son ≈ 450 de 4097
+        # bins, ≈ 9 veces menos memoria en pistas largas.
+        n_keep = min(freqs.size, max(3, int(np.searchsorted(freqs, stft_max_frequency(cfg), side="right")) + 1))
+        mag = np.abs(stft[:n_keep])
+        freqs = freqs[:n_keep]
+        del stft
     mag = mag.astype(np.float32, copy=False)
-    times = librosa.times_like(mag, sr=sr, hop_length=hop_length)
+    times = librosa.times_like(X=mag, sr=sr, hop_length=hop_length)
     logger.info("Espectro %s: %d bins (%.1f–%.1f Hz) × %d frames (hop=%d muestras = %.1f ms)",
                 kind.upper(), mag.shape[0], float(freqs[0]), float(freqs[-1]), mag.shape[1],
                 hop_length, 1000.0 * hop_length / sr)
@@ -468,13 +524,6 @@ def harmonic_template(f0_hz: float, n_harmonics: int) -> HarmonicTemplate:
     )
 
 
-def _tolerance_offsets(tolerance_semitones: float, n_points: int) -> np.ndarray:
-    """Desplazamientos d (semitonos) uniformes en [−tol, +tol]; ``[0]`` si tol ≤ 0."""
-    if tolerance_semitones <= 0 or n_points <= 1:
-        return np.zeros(1)
-    return np.linspace(-tolerance_semitones, tolerance_semitones, n_points)
-
-
 def _log_interp_plan(freqs_hz: np.ndarray, query_hz: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Índices y pesos de interpolación lineal sobre el eje log2(frecuencia).
 
@@ -494,6 +543,11 @@ def _log_interp_plan(freqs_hz: np.ndarray, query_hz: np.ndarray) -> tuple[np.nda
     -------
     tuple of np.ndarray
         ``(i0, i1, w0, w1)`` con la forma de ``query_hz``.
+
+    Raises
+    ------
+    ValueError
+        Si el espectro tiene menos de 2 bins con frecuencia > 0 Hz.
     """
     freqs_hz = np.asarray(freqs_hz, dtype=float)
     valid = np.flatnonzero(freqs_hz > 0)
@@ -512,12 +566,108 @@ def _log_interp_plan(freqs_hz: np.ndarray, query_hz: np.ndarray) -> tuple[np.nda
     return valid[pos], valid[pos + 1], w0, w1
 
 
+@dataclass
+class _WindowPlan:
+    """Plan para leer max X̃ dentro de la ventana de tolerancia de cada consulta.
+
+    Para cada frecuencia consultada x la ventana es
+    [x·2^(−tol/12), x·2^(+tol/12)]. Se guardan la interpolación en sus dos
+    extremos y los bins que caen ESTRICTAMENTE dentro (concatenados para
+    todas las consultas, para usar ``np.maximum.reduceat``).
+
+    Attributes
+    ----------
+    lo, hi : tuple of np.ndarray
+        Plan de :func:`_log_interp_plan` en el extremo inferior y superior.
+    inner_bins : np.ndarray
+        Índices de los bins interiores de todas las consultas, concatenados.
+    inner_starts : np.ndarray
+        Posición en ``inner_bins`` donde empieza el grupo de cada consulta con
+        bins interiores.
+    inner_queries : np.ndarray
+        Índice de la consulta a la que pertenece cada grupo.
+    """
+
+    lo: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+    hi: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+    inner_bins: np.ndarray
+    inner_starts: np.ndarray
+    inner_queries: np.ndarray
+
+    @property
+    def n_columns(self) -> int:
+        """Columnas que se leen por frame (2 extremos × 2 vecinos + bins interiores)."""
+        return 4 * int(self.lo[0].size) + int(self.inner_bins.size)
+
+
+def _window_plan(freqs_hz: np.ndarray, query_hz: np.ndarray, tolerance_semitones: float) -> _WindowPlan:
+    """Prepara la lectura de max X̃ en [x·2^(−tol/12), x·2^(+tol/12)] para cada consulta x.
+
+    Parameters
+    ----------
+    freqs_hz : np.ndarray
+        Frecuencia de cada bin (Hz), creciente, forma ``(n_bins,)``.
+    query_hz : np.ndarray
+        Frecuencias centrales x (Hz), forma ``(Q,)``.
+    tolerance_semitones : float
+        Semiancho de la ventana en semitonos (≤ 0 → sin ventana: se lee x).
+
+    Returns
+    -------
+    _WindowPlan
+        Plan de lectura (independiente de los frames).
+    """
+    freqs_hz = np.asarray(freqs_hz, dtype=float)
+    query = np.asarray(query_hz, dtype=float).ravel()
+    ratio = 2.0 ** (max(float(tolerance_semitones), 0.0) / 12.0)
+    lo_hz, hi_hz = query / ratio, query * ratio
+    valid = np.flatnonzero(freqs_hz > 0)
+    f_valid = freqs_hz[valid]
+    first = np.searchsorted(f_valid, lo_hz, side="right")   # primer bin con f > extremo inferior
+    stop = np.searchsorted(f_valid, hi_hz, side="left")     # primer bin con f ≥ extremo superior
+    counts = np.maximum(stop - first, 0)
+    with_inner = np.flatnonzero(counts > 0)
+    if with_inner.size:
+        inner_bins = np.concatenate([valid[first[q]:stop[q]] for q in with_inner])
+        inner_starts = np.concatenate(([0], np.cumsum(counts[with_inner])[:-1]))
+    else:
+        inner_bins = np.zeros(0, dtype=int)
+        inner_starts = np.zeros(0, dtype=int)
+    return _WindowPlan(lo=_log_interp_plan(freqs_hz, lo_hz), hi=_log_interp_plan(freqs_hz, hi_hz),
+                       inner_bins=inner_bins, inner_starts=inner_starts.astype(int), inner_queries=with_inner)
+
+
+def _read_window_max(block: np.ndarray, plan: _WindowPlan) -> np.ndarray:
+    """max X̃ en la ventana de cada consulta, para un bloque de frames.
+
+    Parameters
+    ----------
+    block : np.ndarray
+        Espectro normalizado X̃, forma ``(n_frames_bloque, n_bins)``.
+    plan : _WindowPlan
+        Plan de :func:`_window_plan`.
+
+    Returns
+    -------
+    np.ndarray
+        Forma ``(n_frames_bloque, Q)``.
+    """
+    i0, i1, w0, w1 = plan.lo
+    best = block[:, i0] * w0 + block[:, i1] * w1                 # X̃ interpolado en x·2^(−tol/12)
+    i0, i1, w0, w1 = plan.hi
+    np.maximum(best, block[:, i0] * w0 + block[:, i1] * w1, out=best)   # ... y en x·2^(+tol/12)
+    if plan.inner_bins.size:
+        # Máximo de los bins interiores de cada ventana (grupos contiguos de columnas).
+        inner = np.maximum.reduceat(block[:, plan.inner_bins], plan.inner_starts, axis=1)
+        best[:, plan.inner_queries] = np.maximum(best[:, plan.inner_queries], inner)
+    return best
+
+
 def salience_components(
     frames_mag: np.ndarray,
     freqs_hz: np.ndarray,
     arm_freqs_hz: np.ndarray,
     cfg: EnvConfig,
-    n_tolerance_points: int = N_TOLERANCE_POINTS,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Energía armónica S⁺ y energía inter-armónica S⁻ de cada frame y candidato.
 
@@ -534,9 +684,7 @@ def salience_components(
     arm_freqs_hz : np.ndarray
         Fundamentales candidatas (Hz), forma ``(n_arms,)``.
     cfg : EnvConfig
-        Usa ``n_harmonics`` y ``tolerance_semitones``.
-    n_tolerance_points : int
-        Puntos con que se explora la ventana ±tolerancia (5 por defecto).
+        Usa ``n_harmonics`` y ``tolerance_semitones`` (semitonos).
 
     Returns
     -------
@@ -557,14 +705,22 @@ def salience_components(
        fuerte con el mismo timbre dan la misma saliencia). Los frames con
        máximo ≤ :data:`SILENCE_FLOOR` se dejan en 0 (saliencia 0).
     2. **Plan de lectura** (independiente de los frames): para cada
-       (brazo, armónico o hueco, punto de tolerancia) se calcula la
-       frecuencia x·2^(d/12), d ∈ [−tol, +tol], y sus índices/pesos de
-       interpolación sobre log2(f). Leer "el máximo dentro de ±tol"
-       absorbe la desafinación y la inarmonicidad de las cuerdas reales
-       (los armónicos de una cuerda gruesa salen ligeramente agudos).
-    3. **Gather**: una sola indexación avanzada lee todas las posiciones de
-       todos los frames a la vez; luego máximo sobre los puntos de
-       tolerancia y suma ponderada sobre h con los pesos w_h.
+       (brazo, armónico o hueco) con frecuencia central x se toma la
+       ventana [x·2^(−tol/12), x·2^(+tol/12)]. Leer "el máximo dentro de
+       ±tol" absorbe la desafinación y la inarmonicidad de las cuerdas
+       reales (los armónicos de una cuerda gruesa salen ligeramente agudos).
+    3. **Gather**: una sola indexación avanzada lee todas las ventanas de
+       todos los frames a la vez; luego máximo dentro de cada ventana y suma
+       ponderada sobre h con los pesos w_h.
+
+    **Máximo EXACTO de la ventana.** X̃ entre bins es la interpolación
+    lineal sobre log2(f), una función lineal a trozos; su máximo en un
+    intervalo se alcanza en uno de los dos extremos o en un bin interior. Por
+    eso basta leer X̃ interpolado en los dos extremos y el máximo de los bins
+    que caen dentro: el resultado no depende de cuántos puntos se muestreen
+    (una rejilla fija de puntos, más separados que el ancho de un pico en los
+    armónicos altos, podía caer a ambos lados del pico y leer su falda) y con
+    tolerancia 0 se reduce a la interpolación en x.
     """
     mag = np.asarray(frames_mag, dtype=np.float64)
     if mag.ndim == 1:
@@ -585,25 +741,21 @@ def salience_components(
     norm = mag / np.where(silent, 1.0, peak)
     norm[:, silent] = 0.0
 
-    # 2) Plan de lectura: posiciones (brazo, {armónico, hueco}, h, punto).
+    # 2) Plan de lectura: una ventana por (brazo, {armónico, hueco}, h).
     templates = [harmonic_template(float(f), cfg.n_harmonics) for f in arm_freqs]
     weights = templates[0].weights  # w_h depende solo de h y N: igual para todos los brazos
-    centers = np.stack([np.stack([t.harmonic_hz, t.interharmonic_hz]) for t in templates])  # (A, 2, H)
-    offsets = _tolerance_offsets(cfg.tolerance_semitones, n_tolerance_points)  # (P,) semitonos
-    query = centers[..., None] * 2.0 ** (offsets / 12.0)  # (A, 2, H, P) en Hz
-    i0, i1, w0, w1 = _log_interp_plan(freqs_hz, query.ravel())
-    shape = (n_arms, 2, cfg.n_harmonics, offsets.size)
+    centers = np.stack([np.stack([t.harmonic_hz, t.interharmonic_hz]) for t in templates])  # (A, 2, H) en Hz
+    plan = _window_plan(freqs_hz, centers.ravel(), cfg.tolerance_semitones)
+    shape = (n_arms, 2, cfg.n_harmonics)
 
     # 3) Gather por bloques de frames (acota la memoria en pistas largas).
     frames_first = np.ascontiguousarray(norm.T)  # (n_frames, n_bins)
     energy = np.empty((n_frames, n_arms, 2))
-    chunk = max(1, _MAX_GATHER_ELEMENTS // i0.size)
+    chunk = max(1, _MAX_GATHER_ELEMENTS // max(plan.n_columns, 1))
     for start in range(0, n_frames, chunk):
         block = frames_first[start:start + chunk]
-        values = block[:, i0] * w0 + block[:, i1] * w1        # X̃(x·2^(d/12)) interpolado
-        values = values.reshape((block.shape[0],) + shape)
-        best = values.max(axis=-1)                             # máximo dentro de ±tolerancia
-        energy[start:start + chunk] = best @ weights           # Σ_h w_h · X̃(...)
+        best = _read_window_max(block, plan).reshape((block.shape[0],) + shape)  # max X̃ en ±tolerancia
+        energy[start:start + chunk] = best @ weights                              # Σ_h w_h · max X̃(...)
     s_plus = np.clip(energy[..., 0], 0.0, 1.0)
     s_minus = np.clip(energy[..., 1], 0.0, 1.0)
     return s_plus, s_minus
@@ -711,6 +863,8 @@ class SegmentBanditData:
         al menos 1).
     salience : np.ndarray
         Forma ``(n_frames_seg, n_arms)``: S_j(f_a) para cada frame y brazo.
+        Las posiciones con el mismo pitch (A-0 y E-5) tienen columnas
+        idénticas (ver :func:`build_segment_data`).
     """
 
     segment: Segment
@@ -784,21 +938,31 @@ def build_segment_data(spectrum: Spectrum, segment: Segment, position: int, cfg:
     Notes
     -----
     Es el ÚNICO paso costoso por segmento: después, cada pull del bandit
-    es una simple lectura de esta matriz.
+    es una simple lectura de esta matriz. La saliencia se calcula una sola
+    vez por nota MIDI candidata (con su frecuencia temperada) y se copia a
+    las columnas de todas las posiciones que tocan esa nota: las posiciones
+    gemelas (A-0 / E-5, ...) tienen exactamente la misma columna.
     """
     frame_idx = _segment_frame_indices(spectrum.times_s, segment, cfg.attack_skip_s)
     arms = candidate_arms(segment.f0_hz, cfg.k_semitones, cfg.n_frets)
-    arm_freqs = np.array([a.freq_hz for a in arms])
-    sal = salience(spectrum.mag[:, frame_idx], spectrum.freqs_hz, arm_freqs, cfg)
+    # La saliencia depende solo del PITCH: se calcula una vez por nota MIDI
+    # (frecuencia temperada 440·2^((m−69)/12)) y se copia a todas sus posiciones.
+    # Así A-0 y E-5 tienen columnas idénticas y solo la penalización los separa.
+    midis = np.array([a.midi for a in arms])
+    unique_midis, column = np.unique(midis, return_inverse=True)
+    pitch_freqs = np.array([midi_to_hz(float(m)) for m in unique_midis])
+    sal_per_pitch = salience(spectrum.mag[:, frame_idx], spectrum.freqs_hz, pitch_freqs, cfg)
+    sal = sal_per_pitch[:, column.ravel()]
     data = SegmentBanditData(segment=segment, position=position, arms=arms,
                              frame_indices=frame_idx, salience=sal)
     means = data.mean_salience
     best = int(np.argmax(means))
     f0_text = "desconocida" if segment.f0_hz is None else f"{segment.f0_hz:.1f} Hz"
-    logger.info("Segmento %d: f0=%s, %d brazos candidatos (%s), mejor saliencia media: %s (%.2f)",
-                position, f0_text, len(arms), _format_arm_list(arms), arms[best].label, float(means[best]))
-    logger.debug("Segmento %d: %d frames (%.3f–%.3f s) usados para la recompensa",
-                 position, frame_idx.size, float(spectrum.times_s[frame_idx[0]]),
+    name = segment_log_name(position, segment.index)
+    logger.info("%s: f0=%s, %d brazos candidatos (%s), mejor saliencia media: %s (%.2f)",
+                name, f0_text, len(arms), _format_arm_list(arms), arms[best].label, float(means[best]))
+    logger.debug("%s: %d frames (%.3f–%.3f s) usados para la recompensa",
+                 name, frame_idx.size, float(spectrum.times_s[frame_idx[0]]),
                  float(spectrum.times_s[frame_idx[-1]]))
     return data
 
@@ -955,7 +1119,24 @@ class BanditEnvironment:
     def from_config(
         cls, data: SegmentBanditData, prev_fret: int | None, cfg: EnvConfig, rng: np.random.Generator
     ) -> "BanditEnvironment":
-        """Atajo que toma ``lam``, ``noise_std`` y ``open_string_free`` de ``cfg``."""
+        """Atajo que toma ``lam``, ``noise_std`` y ``open_string_free`` de ``cfg``.
+
+        Parameters
+        ----------
+        data : SegmentBanditData
+            Datos precalculados del segmento.
+        prev_fret : int | None
+            Traste previo (posición de la mano); None = sin penalización.
+        cfg : EnvConfig
+            Configuración del entorno (λ, ruido σ, cuerdas al aire gratis).
+        rng : np.random.Generator
+            Generador para muestrear frames (y ruido).
+
+        Returns
+        -------
+        BanditEnvironment
+            Entorno equivalente a ``BanditEnvironment(data, prev_fret, cfg.lam, rng, ...)``.
+        """
         return cls(data, prev_fret, cfg.lam, rng, noise_std=cfg.noise_std, open_string_free=cfg.open_string_free)
 
     @property
@@ -1047,7 +1228,23 @@ class BanditEnvironment:
         return float(self.gaps[self._check_arm(arm_index)])
 
     def is_optimal(self, arm_index: int) -> bool:
-        """True si ``arm_index`` está entre los brazos óptimos."""
+        """Indica si un brazo es óptimo (μ_a = μ* salvo :data:`OPTIMAL_TOL`).
+
+        Parameters
+        ----------
+        arm_index : int
+            Índice del brazo (0..K−1).
+
+        Returns
+        -------
+        bool
+            True si ``arm_index`` está entre los brazos óptimos.
+
+        Raises
+        ------
+        IndexError
+            Si el índice está fuera de rango.
+        """
         return bool(self._optimal_mask[self._check_arm(arm_index)])
 
 
@@ -1086,8 +1283,8 @@ def next_hand_fret(arm: Arm, prev_fret: int | None, cfg: EnvConfig) -> int | Non
 
 
 __all__ = [
-    "Arm", "fret_frequency", "all_arms", "candidate_arms", "Spectrum", "compute_spectrum",
+    "Arm", "fret_frequency", "all_arms", "candidate_arms", "Spectrum", "compute_spectrum", "stft_max_frequency",
     "HarmonicTemplate", "harmonic_template", "salience", "salience_components", "playability_penalty",
     "SegmentBanditData", "build_segment_data", "build_all_segment_data", "PullResult",
-    "BanditEnvironment", "next_hand_fret", "N_TOLERANCE_POINTS", "SILENCE_FLOOR", "OPTIMAL_TOL",
+    "BanditEnvironment", "next_hand_fret", "SILENCE_FLOOR", "OPTIMAL_TOL",
 ]

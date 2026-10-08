@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
+import os
 from pathlib import Path
 
 import numpy as np
 import pytest
+import soundfile as sf
 
 from src import io_audio
 from src.io_audio import AudioLoadError, FFmpegNotFoundError, load_audio, save_mp3, save_wav
@@ -14,12 +17,14 @@ needs_ffmpeg = pytest.mark.skipif(io_audio.find_ffmpeg() is None, reason="ffmpeg
 
 
 def _tone(freq: float = 110.0, sr: int = 22050, dur: float = 1.0) -> np.ndarray:
+    """Seno de amplitud 0.5 (float32) de ``freq`` Hz y ``dur`` s."""
     t = np.arange(int(sr * dur)) / sr
     return (0.5 * np.sin(2 * np.pi * freq * t)).astype(np.float32)
 
 
 @needs_ffmpeg
 def test_mp3_round_trip_preserves_pitch_and_length(tmp_path: Path) -> None:
+    """Codificar a MP3 y decodificar conserva la frecuencia del tono y (casi) la duración."""
     sr = 22050
     y = _tone(110.0, sr, 1.0)
     mp3 = save_mp3(tmp_path / "tono.mp3", y, sr)
@@ -35,6 +40,7 @@ def test_mp3_round_trip_preserves_pitch_and_length(tmp_path: Path) -> None:
 
 @needs_ffmpeg
 def test_load_resamples_and_mixes_to_mono(tmp_path: Path) -> None:
+    """Un WAV a 44.1 kHz se remuestrea a la frecuencia pedida (22 050 Hz) sin cambiar su duración."""
     wav = save_wav(tmp_path / "tono.wav", _tone(220.0, 44100, 0.5), 44100)
     y, sr = load_audio(wav, sr=22050)
     assert sr == 22050
@@ -42,11 +48,13 @@ def test_load_resamples_and_mixes_to_mono(tmp_path: Path) -> None:
 
 
 def test_missing_file_raises(tmp_path: Path) -> None:
+    """Un archivo inexistente da AudioLoadError (no una traza de ffmpeg)."""
     with pytest.raises(AudioLoadError):
         load_audio(tmp_path / "no_existe.mp3")
 
 
 def test_missing_ffmpeg_gives_clear_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Sin ffmpeg en el PATH ni en la variable de entorno se lanza FFmpegNotFoundError con instrucciones."""
     wav = save_wav(tmp_path / "tono.wav", _tone(), 22050)
     monkeypatch.setattr(io_audio.shutil, "which", lambda name: None)
     monkeypatch.delenv(io_audio.FFMPEG_ENV_VAR, raising=False)
@@ -56,7 +64,52 @@ def test_missing_ffmpeg_gives_clear_error(tmp_path: Path, monkeypatch: pytest.Mo
 
 @needs_ffmpeg
 def test_corrupt_file_raises_audio_load_error(tmp_path: Path) -> None:
+    """Bytes que no son audio dan AudioLoadError con el detalle de ffmpeg."""
     bad = tmp_path / "corrupto.mp3"
     bad.write_bytes(b"esto no es un mp3")
     with pytest.raises(AudioLoadError):
         load_audio(bad)
+
+
+def test_non_executable_env_var_is_ignored(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                           caplog: pytest.LogCaptureFixture) -> None:
+    """Regresión: SMARTUNER_FFMPEG apuntando a un archivo NO ejecutable se ignora (con aviso)."""
+    fake = tmp_path / "ffmpeg_falso"
+    fake.write_text("no soy un ejecutable")
+    os.chmod(fake, 0o644)
+    monkeypatch.setenv(io_audio.FFMPEG_ENV_VAR, str(fake))
+    monkeypatch.setattr(io_audio.shutil, "which", lambda name: "/ruta/del/path/ffmpeg")
+    with caplog.at_level(logging.WARNING, logger="src.io_audio"):
+        assert io_audio.find_ffmpeg() == "/ruta/del/path/ffmpeg"
+    assert "no es un archivo ejecutable" in caplog.text
+
+
+def test_ffmpeg_that_cannot_run_gives_ffmpeg_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regresión: si el sistema no puede ejecutar ffmpeg (OSError) se lanza FFmpegNotFoundError, no PermissionError."""
+    wav = save_wav(tmp_path / "tono.wav", _tone(), 22050)
+    fake = tmp_path / "ffmpeg_sin_permiso"
+    fake.write_text("#!/bin/sh\n")
+    os.chmod(fake, 0o644)
+    monkeypatch.setattr(io_audio, "require_ffmpeg", lambda: str(fake))
+    with pytest.raises(FFmpegNotFoundError, match="No se pudo ejecutar ffmpeg"):
+        load_audio(wav)
+    with pytest.raises(FFmpegNotFoundError):
+        save_mp3(tmp_path / "salida.mp3", _tone(), 22050)
+
+
+@needs_ffmpeg
+def test_non_finite_samples_are_repaired_or_rejected(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """Regresión: un WAV float con alguna muestra NaN/Inf se repara con 0 (aviso); si hay muchas, se rechaza."""
+    y = _tone(110.0, 22050, 0.5)
+    y[100], y[200] = np.nan, np.inf
+    few = tmp_path / "con_nan.wav"
+    sf.write(str(few), y, 22050, subtype="FLOAT")
+    with caplog.at_level(logging.WARNING, logger="src.io_audio"):
+        loaded, _ = load_audio(few)
+    assert np.all(np.isfinite(loaded))
+    assert "no finitas" in caplog.text
+    y[: y.size // 2] = np.nan
+    many = tmp_path / "muchos_nan.wav"
+    sf.write(str(many), y, 22050, subtype="FLOAT")
+    with pytest.raises(AudioLoadError, match="NaN"):
+        load_audio(many)

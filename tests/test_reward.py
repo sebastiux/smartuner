@@ -6,8 +6,11 @@ Se usan dos tipos de espectros sintéticos:
   exactamente en los armónicos h·f₀. Permiten comparar con los valores
   teóricos calculados a mano a partir de las ecuaciones del encabezado de
   :mod:`src.environment` (pruebas "de pizarra", útiles para la exposición).
-* **CQT de tonos armónicos sintetizados** con numpy (sumas de senos), que
-  incluyen la dispersión real de los picos entre bins vecinos.
+* **CQT y STFT de tonos armónicos sintetizados** con numpy (sumas de
+  senos), que incluyen la dispersión real de los picos entre bins vecinos.
+  La STFT (n_fft = 8192, valor por defecto) tiene picos más anchos que la CQT
+  en el grave (2.7 Hz por bin frente a 1/3 de semitono), así que sus
+  márgenes son menores, pero el pitch correcto gana igual.
 """
 
 from __future__ import annotations
@@ -52,7 +55,15 @@ def _tone(f0: float, amps: list[float], dur: float = 2.0, peak: float = 0.5) -> 
 def _cqt_frames(f0: float, amps: list[float], cfg: EnvConfig | None = None) -> tuple[np.ndarray, np.ndarray]:
     """CQT del tono y frames centrales (lejos de los bordes, donde las
     ventanas largas de la CQT grave mezclan silencio)."""
-    spec = compute_spectrum(_tone(f0, amps), SR, cfg or EnvConfig())
+    spec = compute_spectrum(_tone(f0, amps), SR, cfg or EnvConfig(spectrum="cqt"))
+    assert spec.kind == "cqt"
+    return spec.mag[:, 40:-40], spec.freqs_hz
+
+
+def _stft_frames(f0: float, amps: list[float]) -> tuple[np.ndarray, np.ndarray]:
+    """STFT (configuración por defecto: n_fft = 8192) del tono y frames centrales."""
+    spec = compute_spectrum(_tone(f0, amps), SR, EnvConfig(spectrum="stft", n_fft=8192))
+    assert spec.kind == "stft"
     return spec.mag[:, 40:-40], spec.freqs_hz
 
 
@@ -82,13 +93,18 @@ def _expected(amps: list[float], positions: np.ndarray, f0: float, n: int) -> fl
     return total
 
 
-def _reference_salience(mag: np.ndarray, freqs: np.ndarray, arm_freqs: np.ndarray, cfg: EnvConfig,
-                        n_points: int = 5) -> np.ndarray:
-    """Implementación de referencia con bucles (lenta pero obvia) para validar la vectorizada."""
+def _reference_salience(mag: np.ndarray, freqs: np.ndarray, arm_freqs: np.ndarray, cfg: EnvConfig) -> np.ndarray:
+    """Implementación de referencia con bucles (lenta pero obvia) para validar la vectorizada.
+
+    X̃(x) = máximo de la interpolación lineal (sobre log2 f) en la ventana
+    [x·2^(−tol/12), x·2^(+tol/12)]: como es lineal a trozos, ese máximo es el
+    mayor entre los dos extremos interpolados y los bins que caen dentro.
+    """
     out = np.zeros((mag.shape[1], arm_freqs.size))
     valid = freqs > 0
-    log_f = np.log2(freqs[valid])
-    offsets = np.linspace(-cfg.tolerance_semitones, cfg.tolerance_semitones, n_points)
+    f_valid = freqs[valid]
+    log_f = np.log2(f_valid)
+    ratio = 2.0 ** (cfg.tolerance_semitones / 12.0)
     h = np.arange(1, cfg.n_harmonics + 1)
     w = (1.0 / h) / np.sum(1.0 / h)
     for j in range(mag.shape[1]):
@@ -98,8 +114,11 @@ def _reference_salience(mag: np.ndarray, freqs: np.ndarray, arm_freqs: np.ndarra
         xn = (col / col.max())[valid]
 
         def read(x: float) -> float:
-            pts = np.log2(x * 2.0 ** (offsets / 12.0))
-            return float(np.max(np.interp(pts, log_f, xn, left=0.0, right=0.0)))
+            """max X̃ en [x·2^(−tol/12), x·2^(+tol/12)]: extremos interpolados y bins interiores."""
+            lo, hi = x / ratio, x * ratio
+            ends = np.interp(np.log2([lo, hi]), log_f, xn, left=0.0, right=0.0)
+            inside = xn[(f_valid > lo) & (f_valid < hi)]
+            return float(max(ends.max(), inside.max() if inside.size else 0.0))
 
         for k, f in enumerate(arm_freqs):
             s_plus = sum(w[i] * read(hh * f) for i, hh in enumerate(h))
@@ -114,6 +133,7 @@ def _reference_salience(mag: np.ndarray, freqs: np.ndarray, arm_freqs: np.ndarra
 
 
 def test_harmonic_template_positions_and_weights() -> None:
+    """El template de 55 Hz tiene dientes en h·f, huecos en (h−½)·f y pesos w_h ∝ 1/h normalizados (suman 1, decrecen con h)."""
     t = harmonic_template(55.0, 5)
     assert isinstance(t, HarmonicTemplate)
     assert t.f0_hz == 55.0
@@ -127,6 +147,7 @@ def test_harmonic_template_positions_and_weights() -> None:
 
 @pytest.mark.parametrize("f0, n", [(0.0, 5), (-10.0, 5), (55.0, 0)])
 def test_harmonic_template_rejects_invalid(f0: float, n: int) -> None:
+    """Una fundamental ≤ 0 Hz o N < 1 armónicos es un error."""
     with pytest.raises(ValueError):
         harmonic_template(f0, n)
 
@@ -250,6 +271,7 @@ def test_vectorized_matches_reference_loop() -> None:
 
 @pytest.mark.parametrize("beta", [0.0, 0.5, 2.0])
 def test_salience_in_unit_interval(beta: float) -> None:
+    """Para cualquier espectro y cualquier β la saliencia S = max(S⁺ − β·S⁻, 0) queda en [0, 1]."""
     rng = np.random.default_rng(5)
     freqs = 32.70 * 2.0 ** (np.arange(216) / 36.0)
     mag = rng.random((216, 30)) * rng.random(30) * 10.0
@@ -260,6 +282,7 @@ def test_salience_in_unit_interval(beta: float) -> None:
 
 
 def test_salience_of_real_tone_in_unit_interval() -> None:
+    """Con la CQT de un tono real la saliencia está en [0, 1] y el pitch correcto supera 0.5."""
     mag, freqs = _cqt_frames(73.42, BASS_PROFILE)
     arm_freqs = np.array([Arm(s, f).freq_hz for s in "EADG" for f in range(13)])
     s = salience(mag, freqs, arm_freqs, EnvConfig(beta=0.0))
@@ -268,6 +291,7 @@ def test_salience_of_real_tone_in_unit_interval() -> None:
 
 
 def test_silent_frame_gives_zero() -> None:
+    """Un frame silencioso (máximo ≤ SILENCE_FLOOR) no se normaliza y su saliencia es exactamente 0."""
     mag = _comb_spectrum(55.0, BASS_PROFILE).repeat(3, axis=1)
     mag[:, 1] = 0.0                       # silencio digital
     mag[:, 2] = SILENCE_FLOOR * 1e-3      # "casi" silencio (por debajo del umbral)
@@ -286,6 +310,7 @@ def test_salience_is_volume_invariant() -> None:
 
 
 def test_single_frame_and_empty_inputs() -> None:
+    """Un único frame 1-D y una matriz sin frames se aceptan; bins incoherentes con el eje de frecuencias son un error."""
     cfg = EnvConfig()
     one = _comb_spectrum(55.0, BASS_PROFILE)[:, 0]  # 1-D = un frame
     assert salience(one, GRID_HZ, np.array([55.0]), cfg).shape == (1, 1)
@@ -329,5 +354,92 @@ def test_tuning_tolerance_absorbs_detuning() -> None:
         s = salience(detuned_mag, freqs, neighbors, cfg).mean(axis=0)
         assert s[2] >= 0.95 * tuned[2]
         assert s[2] > 2 * np.delete(s, 2).max()
+        strict = salience(detuned_mag, freqs, neighbors, EnvConfig(tolerance_semitones=0.0)).mean(axis=0)
+        assert strict[2] < s[2] - 0.03
+
+
+# ---------------------------------------------------------------------------
+# Saliencia en tonos sintetizados (STFT, representación por defecto)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("arm", [Arm("E", 0), Arm("E", 1), Arm("A", 3), Arm("D", 5), Arm("G", 9), Arm("G", 12)],
+                         ids=lambda a: a.label)
+def test_correct_pitch_wins_with_stft(arm: Arm) -> None:
+    """Con la STFT por defecto el pitch correcto también tiene la mayor saliencia.
+
+    En el registro más grave (E1 = 41.2 Hz) un semitono son 2.4 Hz, menos que
+    un bin de la STFT (2.7 Hz): la fundamental no discrimina y el margen sale
+    de los armónicos superiores (5·41.2 Hz = 206 Hz, donde un semitono son
+    12 Hz ≈ 4.5 bins). Por eso el margen exigido es menor que con la CQT.
+    """
+    mag, freqs = _stft_frames(arm.freq_hz, BASS_PROFILE)
+    cands = candidate_arms(arm.freq_hz, 2)
+    s = salience(mag, freqs, np.array([a.freq_hz for a in cands]), EnvConfig()).mean(axis=0)
+    correct = np.array([a.midi == arm.midi for a in cands])
+    assert cands[int(np.argmax(s))].midi == arm.midi
+    assert s[correct].min() > 1.5 * s[~correct].max()
+
+
+def test_octave_error_stft_beta_fixes_it() -> None:
+    """β también corrige el error de octava hacia arriba sobre la STFT."""
+    f0 = 55.0
+    mag, freqs = _stft_frames(f0, WEAK_FUNDAMENTAL)
+    cands = np.array([f0, 2 * f0])
+    s0 = salience(mag, freqs, cands, EnvConfig(beta=0.0)).mean(axis=0)
+    s5 = salience(mag, freqs, cands, EnvConfig(beta=0.5)).mean(axis=0)
+    assert s0[1] > s0[0]            # β=0: la octava arriba gana (error de octava)
+    assert s5[0] > s5[1] + 0.03     # β=0.5: el correcto gana
+    assert s5[0] == pytest.approx(s0[0], abs=0.02)
+
+
+def test_tolerance_window_is_exact_max() -> None:
+    """La ventana ±tol se lee ENTERA: un pico estrecho entre dos puntos de una rejilla fija cuenta.
+
+    Regresión: antes se tomaba el máximo de 5 puntos fijos separados
+    0.165 semitonos; en 980 Hz (5.º armónico de G-12 = 196 Hz) esos puntos
+    están a ≈ 9.4 Hz y un pico de 1 bin en 985 Hz (+8.8 cents) caía entre
+    dos de ellos y se leía como 0.
+    """
+    freqs = np.arange(1.0, 1501.0)                   # 1 Hz por bin
+    mag = np.zeros((freqs.size, 1))
+    mag[984, 0] = 1.0                                # pico de 1 bin en 985 Hz
+    cfg = EnvConfig(n_harmonics=5, beta=0.0, tolerance_semitones=0.33)
+    w5 = harmonic_template(196.0, 5).weights[4]
+    s = salience(mag, freqs, np.array([196.0]), cfg)
+    assert s[0, 0] == pytest.approx(w5 * 1.0)        # el 5.º armónico lee el pico completo
+    # Fuera de la ventana (±0.33 st ≈ ±18.8 Hz en 980 Hz) el pico no cuenta.
+    mag_far = np.zeros_like(mag)
+    mag_far[1004, 0] = 1.0                           # 1005 Hz = +44 cents
+    assert salience(mag_far, freqs, np.array([196.0]), cfg)[0, 0] == pytest.approx(0.0)
+
+
+def test_detuning_within_tolerance_does_not_scallop_stft() -> None:
+    """Con la STFT, una desafinación pequeña (≤ 16 cents) no hunde la saliencia del pitch correcto.
+
+    Regresión del "festoneado": con la rejilla de 5 puntos, G-12 desafinado
+    8 cents bajaba un 15 % respecto a afinado (0.50 frente a 0.59) mientras
+    que 16.5 cents subía; ahora la lectura es estable dentro de la ventana.
+    """
+    f0 = Arm("G", 12).freq_hz
+    amps = [1.0 / h for h in range(1, 6)]
+    tuned = salience(*_stft_frames(f0, amps), np.array([f0]), EnvConfig()).mean()
+    for cents in (4.0, 8.0, 12.0, 16.5):
+        detuned = salience(*_stft_frames(f0 * 2.0 ** (cents / 1200.0), amps), np.array([f0]), EnvConfig()).mean()
+        assert detuned >= 0.95 * tuned, f"{cents} cents: {detuned:.3f} frente a {tuned:.3f} afinado"
+
+
+def test_tuning_tolerance_absorbs_detuning_stft() -> None:
+    """La tolerancia ±0.33 semitonos absorbe 20 cents de desafinación también con la STFT."""
+    nominal = 55.0
+    neighbors = nominal * 2.0 ** (np.array([-2, -1, 0, 1, 2]) / 12.0)
+    cfg = EnvConfig(tolerance_semitones=0.33)
+    tuned = salience(*_stft_frames(nominal, BASS_PROFILE), neighbors, cfg).mean(axis=0)
+    for cents in (20.0, -20.0):
+        detuned_mag, freqs = _stft_frames(nominal * 2.0 ** (cents / 1200.0), BASS_PROFILE)
+        s = salience(detuned_mag, freqs, neighbors, cfg).mean(axis=0)
+        assert int(np.argmax(s)) == 2
+        assert s[2] >= 0.9 * tuned[2]
+        assert s[2] > 1.4 * np.delete(s, 2).max()
         strict = salience(detuned_mag, freqs, neighbors, EnvConfig(tolerance_semitones=0.0)).mean(axis=0)
         assert strict[2] < s[2] - 0.03

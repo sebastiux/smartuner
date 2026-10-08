@@ -1,0 +1,163 @@
+{
+  "meta": {
+    "piece": "riff_saltos",
+    "bpm": 100.0,
+    "sr": 22050,
+    "method": "fluidsynth",
+    "tuning": {
+      "E": 41.2,
+      "A": 55.0,
+      "D": 73.42,
+      "G": 98.0
+    },
+    "program": 33,
+    "program_name": "Electric Bass (finger)",
+    "soundfont": "FluidR3_GM.sf2",
+    "legato": 0.9,
+    "lead_in_s": 0.5,
+    "duration_s": 6.34,
+    "n_notes": 20
+  },
+  "notes": [
+    {
+      "onset_s": 0.5,
+      "offset_s": 0.77,
+      "midi": 28,
+      "string": "E",
+      "fret": 0
+    },
+    {
+      "onset_s": 0.8,
+      "offset_s": 1.07,
+      "midi": 28,
+      "string": "E",
+      "fret": 0
+    },
+    {
+      "onset_s": 1.1,
+      "offset_s": 1.37,
+      "midi": 40,
+      "string": "D",
+      "fret": 2
+    },
+    {
+      "onset_s": 1.4,
+      "offset_s": 1.67,
+      "midi": 28,
+      "string": "E",
+      "fret": 0
+    },
+    {
+      "onset_s": 1.7,
+      "offset_s": 1.835,
+      "midi": 31,
+      "string": "E",
+      "fret": 3
+    },
+    {
+      "onset_s": 1.85,
+      "offset_s": 1.985,
+      "midi": 31,
+      "string": "E",
+      "fret": 3
+    },
+    {
+      "onset_s": 2.0,
+      "offset_s": 2.27,
+      "midi": 38,
+      "string": "A",
+      "fret": 5
+    },
+    {
+      "onset_s": 2.3,
+      "offset_s": 2.57,
+      "midi": 45,
+      "string": "G",
+      "fret": 2
+    },
+    {
+      "onset_s": 2.6,
+      "offset_s": 2.87,
+      "midi": 38,
+      "string": "A",
+      "fret": 5
+    },
+    {
+      "onset_s": 2.9,
+      "offset_s": 3.035,
+      "midi": 33,
+      "string": "E",
+      "fret": 5
+    },
+    {
+      "onset_s": 3.05,
+      "offset_s": 3.185,
+      "midi": 33,
+      "string": "E",
+      "fret": 5
+    },
+    {
+      "onset_s": 3.2,
+      "offset_s": 3.47,
+      "midi": 33,
+      "string": "E",
+      "fret": 5
+    },
+    {
+      "onset_s": 3.5,
+      "offset_s": 3.77,
+      "midi": 45,
+      "string": "D",
+      "fret": 7
+    },
+    {
+      "onset_s": 3.8,
+      "offset_s": 4.07,
+      "midi": 33,
+      "string": "E",
+      "fret": 5
+    },
+    {
+      "onset_s": 4.1,
+      "offset_s": 4.235,
+      "midi": 40,
+      "string": "A",
+      "fret": 7
+    },
+    {
+      "onset_s": 4.25,
+      "offset_s": 4.385,
+      "midi": 40,
+      "string": "A",
+      "fret": 7
+    },
+    {
+      "onset_s": 4.4,
+      "offset_s": 4.67,
+      "midi": 47,
+      "string": "G",
+      "fret": 4
+    },
+    {
+      "onset_s": 4.7,
+      "offset_s": 4.97,
+      "midi": 43,
+      "string": "D",
+      "fret": 5
+    },
+    {
+      "onset_s": 5.0,
+      "offset_s": 5.27,
+      "midi": 36,
+      "string": "A",
+      "fret": 3
+    },
+    {
+      "onset_s": 5.3,
+      "offset_s": 5.84,
+      "midi": 31,
+      "string": "E",
+      "fret": 3
+    }
+  ]
+}

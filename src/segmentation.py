@@ -56,8 +56,10 @@ logger = logging.getLogger(__name__)
 #: quedan residuos del filtro, así que esas bandas solo aportarían ruido.
 ONSET_FMAX_HZ: float = 1000.0
 
-#: Número de bandas mel entre 0 y :data:`ONSET_FMAX_HZ` (≈ 25 Hz por banda,
-#: unas 2–5 bandas por armónico de bajo con ``n_fft = 2048``).
+#: Número de bandas mel entre 0 y :data:`ONSET_FMAX_HZ`. Por debajo de 1 kHz
+#: la escala mel es casi lineal: ≈ 25 Hz entre bandas, de modo que incluso
+#: los armónicos de E1 (separados 41.2 Hz) caen en bandas distintas, y cada
+#: banda abarca varios bins de la FFT (10.8 Hz con ``n_fft = 2048``).
 ONSET_N_MELS: int = 40
 
 #: Rango dinámico (dB) del espectrograma log-mel: todo lo que esté más de
@@ -214,8 +216,8 @@ def onset_envelope(
     * ``fmax ≈ 1000 Hz`` concentra las bandas donde hay bajo
       (fundamentales de 41–196 Hz y sus primeros armónicos);
     * el piso de ``−40 dB`` respecto al máximo de la pista ignora esos
-      cambios en bandas casi vacías (la energía por debajo del umbral de
-      silencio, −35 dB, no aporta información de onset).
+      cambios en bandas casi vacías: que una banda pase de −70 a −50 dB no
+      es un ataque, es fuga espectral.
 
     **Evaluación.** Se compararon, con ``delta = 0.07`` y ``backtrack``,
     sobre (a) 20 pistas sintéticas de 8 notas de bajo filtradas a 400 Hz
@@ -249,9 +251,8 @@ def onset_envelope(
     se detectan notas hasta ≈ 27 dB por debajo de la más fuerte; con −30 dB,
     solo hasta ≈ −18 dB. El piso por defecto de librosa (−80 dB) detecta
     notas aún más suaves a costa de muchos onsets falsos en los finales de
-    nota. −40 dB queda justo por debajo del umbral de silencio por defecto
-    (−35 dB), así que casi toda nota que la segmentación conservaría puede
-    generar su onset.
+    nota. −40 dB cubre la dinámica habitual de una línea de bajo (rara vez
+    hay más de 20–25 dB entre la nota más fuerte y la más suave).
 
     Examples
     --------
@@ -284,10 +285,11 @@ def onset_envelope(
         return np.zeros(n_frames, dtype=np.float32)
 
     # Potencia → dB relativos al máximo de la pista, con piso en −floor_db.
-    log_mel = librosa.power_to_db(mel, ref=np.max, top_db=floor_db)
+    log_mel = librosa.power_to_db(S=mel, ref=np.max, top_db=floor_db)
 
     # Flux espectral: media sobre bandas de los aumentos positivos de nivel.
-    # librosa además compensa el retardo del enventanado centrado.
+    # (librosa desplaza la curva n_fft/(2·hop) frames para alinear cada valor
+    # con el instante del cambio a pesar de la ventana larga.)
     env = librosa.onset.onset_strength(S=log_mel, sr=sr, hop_length=hop, n_fft=n_fft)
     return env[:n_frames]
 
@@ -631,7 +633,7 @@ def segment_audio(
             )
         )
         logger.debug(
-            "Segmento %d: %.3f–%.3f s (%.0f ms), RMS medio %.1f dB → %s",
+            "Segmento detectado n.º %d: %.3f–%.3f s (%.0f ms), RMS medio %.1f dB → %s",
             index, start / sr, end / sr, 1000.0 * (end - start) / sr, seg_rms_db, reason,
         )
 

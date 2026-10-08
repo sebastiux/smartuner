@@ -64,7 +64,9 @@ class AudioLoadError(RuntimeError):
 def find_ffmpeg() -> str | None:
     """Localiza el ejecutable de ffmpeg.
 
-    Primero consulta la variable de entorno ``SMARTUNER_FFMPEG`` y después el PATH.
+    Primero consulta la variable de entorno ``SMARTUNER_FFMPEG`` y después el
+    PATH. La variable solo se usa si apunta a un archivo EJECUTABLE; si no,
+    se avisa en el log y se busca en el PATH.
 
     Returns
     -------
@@ -78,8 +80,10 @@ def find_ffmpeg() -> str | None:
     '/usr/bin/ffmpeg'
     """
     explicit = os.environ.get(FFMPEG_ENV_VAR)
-    if explicit and Path(explicit).is_file():
-        return explicit
+    if explicit:
+        if Path(explicit).is_file() and os.access(explicit, os.X_OK):
+            return explicit
+        logger.warning("%s=%s no es un archivo ejecutable; se busca ffmpeg en el PATH", FFMPEG_ENV_VAR, explicit)
     return shutil.which("ffmpeg")
 
 
@@ -102,6 +106,38 @@ def require_ffmpeg() -> str:
     return path
 
 
+def _run_ffmpeg(cmd: list[str], data: bytes | None = None) -> subprocess.CompletedProcess[bytes]:
+    """Ejecuta ffmpeg y traduce los fallos al LANZARLO (no los de decodificación).
+
+    Parameters
+    ----------
+    cmd : list[str]
+        Comando completo (el primer elemento es la ruta de ffmpeg).
+    data : bytes | None, optional
+        Datos para la entrada estándar.
+
+    Returns
+    -------
+    subprocess.CompletedProcess[bytes]
+        Resultado con ``returncode``, ``stdout`` y ``stderr``.
+
+    Raises
+    ------
+    FFmpegNotFoundError
+        Si el sistema no pudo ejecutar el programa (sin permiso de ejecución,
+        borrado entre la búsqueda y la llamada, formato no ejecutable...).
+    """
+    try:
+        return subprocess.run(cmd, input=data, capture_output=True, check=False)
+    except OSError as exc:
+        raise FFmpegNotFoundError(f"No se pudo ejecutar ffmpeg ({cmd[0]}): {exc}.\n\n{_INSTALL_HELP}") from exc
+
+
+#: Fracción máxima de muestras no finitas (NaN/Inf) que se reparan con 0; por
+#: encima, el archivo se considera corrupto.
+MAX_NONFINITE_FRACTION: float = 0.01
+
+
 def load_audio(path: str | Path, sr: int = 22050) -> tuple[np.ndarray, int]:
     """Decodifica un archivo de audio a mono ``float32`` en [-1, 1].
 
@@ -122,9 +158,17 @@ def load_audio(path: str | Path, sr: int = 22050) -> tuple[np.ndarray, int]:
     Raises
     ------
     FFmpegNotFoundError
-        Si ffmpeg no está instalado.
+        Si ffmpeg no está instalado o no se puede ejecutar.
     AudioLoadError
-        Si el archivo no existe o no se puede decodificar.
+        Si el archivo no existe, no se puede decodificar o más del 1 % de sus
+        muestras no son finitas (NaN/Inf).
+
+    Notes
+    -----
+    Un WAV en coma flotante puede contener muestras NaN o ±Inf (archivo
+    dañado o mal exportado); librosa las rechaza más adelante con un error
+    críptico. Si son pocas (≤ :data:`MAX_NONFINITE_FRACTION`) se reemplazan
+    por 0 (silencio de una muestra) con un aviso en el log.
 
     Examples
     --------
@@ -145,13 +189,21 @@ def load_audio(path: str | Path, sr: int = 22050) -> tuple[np.ndarray, int]:
         "-",                                    # salida por stdout
     ]
     logger.info("Decodificando %s con ffmpeg (mono, %d Hz)", path.name, sr)
-    proc = subprocess.run(cmd, capture_output=True, check=False)
+    proc = _run_ffmpeg(cmd)
     if proc.returncode != 0:
         detail = proc.stderr.decode("utf-8", errors="replace").strip()
         raise AudioLoadError(f"ffmpeg no pudo decodificar {path.name}: {detail}")
     y = np.frombuffer(proc.stdout, dtype=np.float32).copy()
     if y.size == 0:
         raise AudioLoadError(f"El archivo {path.name} no contiene audio decodificable.")
+    bad = ~np.isfinite(y)
+    if bad.any():
+        n_bad = int(bad.sum())
+        if n_bad > MAX_NONFINITE_FRACTION * y.size:
+            raise AudioLoadError(f"El archivo {path.name} está dañado: {n_bad} de {y.size} muestras no son "
+                                 "números finitos (NaN/Inf).")
+        logger.warning("%s contiene %d muestras no finitas (NaN/Inf); se reemplazan por 0", path.name, n_bad)
+        y[bad] = 0.0
     logger.info("Audio cargado: %.2f s, %d muestras", y.size / sr, y.size)
     return y, int(sr)
 
@@ -201,7 +253,7 @@ def save_mp3(path: str | Path, y: np.ndarray, sr: int, bitrate: str = "192k") ->
     Raises
     ------
     FFmpegNotFoundError
-        Si ffmpeg no está instalado.
+        Si ffmpeg no está instalado o no se puede ejecutar.
     RuntimeError
         Si la codificación falla.
     """
@@ -215,7 +267,7 @@ def save_mp3(path: str | Path, y: np.ndarray, sr: int, bitrate: str = "192k") ->
         "-codec:a", "libmp3lame", "-b:a", bitrate,
         str(path),
     ]
-    proc = subprocess.run(cmd, input=data, capture_output=True, check=False)
+    proc = _run_ffmpeg(cmd, data=data)
     if proc.returncode != 0:
         raise RuntimeError(f"ffmpeg no pudo crear {path.name}: {proc.stderr.decode('utf-8', errors='replace')}")
     logger.info("MP3 escrito: %s", path)
@@ -238,6 +290,15 @@ def convert_to_mp3(src: str | Path, dst: str | Path, bitrate: str = "192k") -> P
     -------
     Path
         Ruta del MP3 escrito.
+
+    Raises
+    ------
+    AudioLoadError
+        Si ``src`` no existe.
+    FFmpegNotFoundError
+        Si ffmpeg no está instalado o no se puede ejecutar.
+    RuntimeError
+        Si la conversión falla.
     """
     src, dst = Path(src), Path(dst)
     if not src.is_file():
@@ -245,7 +306,7 @@ def convert_to_mp3(src: str | Path, dst: str | Path, bitrate: str = "192k") -> P
     dst.parent.mkdir(parents=True, exist_ok=True)
     ffmpeg = require_ffmpeg()
     cmd = [ffmpeg, "-nostdin", "-v", "error", "-y", "-i", str(src), "-codec:a", "libmp3lame", "-b:a", bitrate, str(dst)]
-    proc = subprocess.run(cmd, capture_output=True, check=False)
+    proc = _run_ffmpeg(cmd)
     if proc.returncode != 0:
         raise RuntimeError(f"ffmpeg no pudo convertir {src.name}: {proc.stderr.decode('utf-8', errors='replace')}")
     logger.info("Convertido a MP3: %s", dst)

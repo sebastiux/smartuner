@@ -308,6 +308,7 @@ class _OutputReader(threading.Thread):
         self._emit(self._pending)
 
     def run(self) -> None:
+        """Lee la salida del subproceso por bloques hasta que se cierra (cuerpo del hilo)."""
         read = getattr(self._stream, "read1", self._stream.read)
         while True:
             try:
@@ -320,7 +321,13 @@ class _OutputReader(threading.Thread):
         self._feed(self._decoder.decode(b"", final=True) + "\n")
 
     def tail_text(self) -> str:
-        """Últimas líneas de la salida como un solo texto."""
+        """Últimas líneas de la salida como un solo texto.
+
+        Returns
+        -------
+        str
+            Las líneas guardadas en ``tail``, unidas con saltos de línea.
+        """
         return "\n".join(self.tail)
 
 
@@ -405,6 +412,7 @@ def separate_bass(
         raise SeparationError(f"No existe el archivo de audio a separar: {path}")
 
     def report(fraction: float, message: str) -> None:
+        """Reenvía ``(fracción 0–1, mensaje)`` al callback del usuario, si lo hay."""
         if progress is not None:
             progress(fraction, message)
 
@@ -450,6 +458,7 @@ def separate_bass(
         reader.start()
 
         def forward(percent: float) -> None:
+            """Traduce el porcentaje de tqdm (0–100) a progreso 0–1 y lo anota en el log."""
             logger.debug("Demucs: %.0f %%", percent)
             report(percent / 100.0, f"Demucs: {percent:.0f} %")
 
