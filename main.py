@@ -19,8 +19,9 @@ Línea de comandos (``--cli`` + subcomando)::
 
     # 2. Transcribir una pista con un algoritmo: imprime la tablatura ASCII y la
     #    exporta a TXT/JSON/CSV; si hay ground truth imprime la precisión.
-    python main.py --cli analyze AUDIO [--algo ucb1] [--separate] [--config cfg.json]
-                                       [--seed N] [--out results/<nombre>]
+    python main.py --cli analyze AUDIO [--algo ucb1] [--separate]
+                                       [--separation-method auto|demucs|hpss]
+                                       [--config cfg.json] [--seed N] [--out results/<nombre>]
 
     # 3. Experimento comparativo de los 4 algoritmos: tabla, CSV y gráficas.
     python main.py --cli experiment AUDIO [--runs 100] [--budget T] [--no-sweeps]
@@ -38,6 +39,7 @@ Ejemplos
 
     python main.py --cli dataset
     python main.py --cli analyze data/synthetic/linea_simple.mp3 --algo softmax
+    python main.py --cli analyze cancion_completa.mp3 --separation-method hpss
     python main.py --cli experiment data/synthetic/cromatica.mp3 --runs 100 --no-sweeps
 
 Códigos de salida: 0 = correcto, 1 = error (archivo ilegible, Demucs ausente,
@@ -54,7 +56,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from src.config import ALGO_LABELS, ALGORITHMS, DATA_DIR, RESULTS_DIR, Config
+from src.config import ALGO_LABELS, ALGORITHMS, DATA_DIR, RESULTS_DIR, SEPARATION_METHODS, Config
 
 logger = logging.getLogger("smartuner")
 
@@ -276,7 +278,8 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     Parameters
     ----------
     args : argparse.Namespace
-        Usa ``audio``, ``algo``, ``separate``, ``config``, ``seed`` y ``out``.
+        Usa ``audio``, ``algo``, ``separate``, ``separation_method`` (implica
+        ``separate``), ``config``, ``seed`` y ``out``.
 
     Returns
     -------
@@ -291,6 +294,10 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
     if args.separate:
         cfg.audio.separate_bass = True
+    if getattr(args, "separation_method", None):
+        # Elegir un método solo tiene sentido separando: implica --separate.
+        cfg.audio.separate_bass = True
+        cfg.audio.separation_method = args.separation_method
     if args.seed is not None:
         cfg.experiment.seed = args.seed
     cfg.validate()
@@ -463,7 +470,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_an = sub.add_parser("analyze", parents=[common], help="transcribir un audio con un algoritmo")
     p_an.add_argument("audio", help="archivo de audio (MP3, WAV, ...)")
     p_an.add_argument("--algo", choices=ALGORITHMS, default="ucb1", help="algoritmo bandit (por defecto ucb1)")
-    p_an.add_argument("--separate", action="store_true", help="aislar el bajo de una mezcla con Demucs")
+    p_an.add_argument("--separate", action="store_true",
+                      help="aislar el bajo de una mezcla (método de la configuración; por defecto auto)")
+    p_an.add_argument("--separation-method", choices=SEPARATION_METHODS, default=None,
+                      help="método de separación (implica --separate): auto = Demucs si está instalado, si no "
+                           "HPSS; demucs = red neuronal (mejor, lenta, requiere pip install demucs); hpss = "
+                           "armónico-percusiva + pasa-bajas (segundos, aproximada)")
     p_an.add_argument("--config", help="configuración JSON (guardada desde la GUI)")
     p_an.add_argument("--seed", type=int, help="semilla maestra (por defecto la de la configuración)")
     p_an.add_argument("--out", help="carpeta de salida (por defecto results/<nombre>)")

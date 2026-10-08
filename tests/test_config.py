@@ -86,6 +86,7 @@ def test_wrong_types_are_rejected(data: object, message: str) -> None:
     ("env", {"initial_hand_fret": 12, "n_frets": 5}, "fuera del diapasón"),
     ("env", {"spectrum": "cqt", "n_octaves": 9}, "Nyquist"),
     ("agent", {"recommend": "random"}, "agent.recommend"),
+    ("audio", {"separation_method": "spleeter"}, "audio.separation_method debe ser una de: auto, demucs, hpss"),
 ])
 def test_out_of_range_values_are_rejected(section: str, values: dict, message: str) -> None:
     """Regresión: rangos de PARAM_SPECS y restricciones cruzadas se comprueban al cargar."""
@@ -159,3 +160,24 @@ def test_algorithm_style_tables_are_complete() -> None:
     keys = set(ALGORITHMS) | {"oracle", "oracle_viterbi"}
     for table in (ALGO_LABELS, ALGO_COLORS, ALGO_MARKERS, ALGO_LINESTYLES):
         assert keys <= set(table)
+
+
+def test_separation_method_default_and_choices(tmp_path: Path) -> None:
+    """audio.separation_method: «auto» por defecto, opciones de SEPARATION_METHODS y viaja en el JSON."""
+    from src.config import SEPARATION_METHODS
+
+    cfg = Config()
+    assert cfg.audio.separation_method == "auto"
+    assert cfg.audio.separate_bass is False and cfg.audio.demucs_model == "htdemucs"
+    spec = PARAM_SPECS["audio.separation_method"]
+    assert spec.kind == "choice" and spec.choices == SEPARATION_METHODS == ("auto", "demucs", "hpss")
+    assert "HPSS" in spec.help and "Demucs" in spec.help
+    for method in SEPARATION_METHODS:
+        cfg.audio.separation_method = method
+        cfg.validate()
+        path = tmp_path / f"{method}.json"
+        cfg.save_json(path)
+        assert Config.load_json(path).audio.separation_method == method
+    cfg.audio.separation_method = 3  # type: ignore[assignment]
+    with pytest.raises(ValueError, match="audio.separation_method debe ser un texto"):
+        cfg.validate()
