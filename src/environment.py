@@ -1,38 +1,125 @@
-"""Etapa 6 — Entorno bandit por segmento. [CONTRATO: implementar]
+"""Etapa 6 — Entorno bandit por segmento: brazos, recompensa armónica y regret.
 
-Cada segmento de nota es un problema Multi-Armed Bandit independiente:
+Papel en el pipeline
+--------------------
+Las etapas 1–5 entregan, para cada nota detectada, un :class:`Segment` con
+sus tiempos y una f0 aproximada (pYIN). Este módulo convierte cada segmento
+en un problema **Multi-Armed Bandit** independiente que los agentes de
+:mod:`src.agents` resuelven pull a pull:
 
-* **Brazos**: posiciones (cuerda, traste) con f(cuerda, traste) = f_cuerda·2^(traste/12),
-  podadas a ±k semitonos de la f0 estimada por pYIN (k=None → 52 brazos).
-* **Recompensa** de un pull del brazo a: se elige un frame j al azar del
-  segmento y se calcula
+    espectro de la pista ─┐
+    segmento + f0 ────────┼─► brazos candidatos ─► matriz salience[frame, brazo]
+    configuración (k,N,β) ┘                                   │
+                                                              ▼
+                       BanditEnvironment.pull(a)  ─►  r = S_j(f_a) − penalización
 
-      X̃_j      = |X_j| / max|X_j|                          (espectro del frame normalizado)
-      S⁺_j(f)  = Σ_h w_h · X̃_j(h·f) / Σ_h w_h             (energía en los armónicos)
-      S⁻_j(f)  = Σ_h w_h · X̃_j((h−½)·f) / Σ_h w_h         (energía ENTRE armónicos)
-      S_j(f)   = max(S⁺_j(f) − β·S⁻_j(f), 0)               (saliencia ∈ [0, 1])
-      r        = S_j(f_a) − λ·|traste_a − traste_previo|/12 (+ ruido opcional)
+Brazos
+------
+Cada brazo es una posición (cuerda, traste) del diapasón, con frecuencia
 
-  con h = 1..N y w_h = 1/h. X̃(x) se lee como el máximo de la magnitud
-  interpolada dentro de ±``tolerance_semitones`` alrededor de x.
-* **Valor real** μ_a = media sobre TODOS los frames del segmento de S_j(f_a)
-  menos la penalización: se calcula exactamente y solo se usa para medir
-  regret y % de brazo óptimo (el agente nunca lo ve).
+    f(cuerda, traste) = f_cuerda · 2^(traste/12)
 
+(cada traste sube un semitono = multiplica la frecuencia por 2^(1/12)). En
+afinación estándar hay 4 cuerdas × 13 trastes (0–12) = 52 brazos. Se podan a
+los que están a ±k semitonos de la f0 estimada por pYIN (k=None → 52 brazos):
+la f0 solo sirve para que el problema sea más pequeño; la DECISIÓN la toman
+los agentes.
+
+Recompensa de un pull
+---------------------
+Al jalar el brazo a se elige un frame j al azar del segmento y se calcula::
+
+    X̃_j      = |X_j| / max|X_j|                          (espectro del frame normalizado)
+    S⁺_j(f)  = Σ_h w_h · X̃_j(h·f) / Σ_h w_h             (energía en los armónicos)
+    S⁻_j(f)  = Σ_h w_h · X̃_j((h−½)·f) / Σ_h w_h         (energía ENTRE armónicos)
+    S_j(f)   = max(S⁺_j(f) − β·S⁻_j(f), 0)               (saliencia ∈ [0, 1])
+    r        = S_j(f_a) − λ·|traste_a − traste_previo|/12 (+ ruido opcional)
+
+con h = 1..N y w_h = 1/h. X̃(x) se lee como el máximo de la magnitud
+interpolada dentro de ±``tolerance_semitones`` alrededor de x.
+
+**Template armónico.** Una cuerda pulsada vibra a la vez en su fundamental f
+y en sus múltiplos 2f, 3f, 4f... (serie armónica). La "huella" de una nota en
+el espectro es, por tanto, un peine de picos en h·f. La saliencia S⁺ mide
+cuánto encaja el espectro observado con el peine de cada candidato
+(*suma armónica*, Klapuri 2006). Los pesos w_h = 1/h dan más importancia a
+los armónicos graves, que en el bajo son los más fuertes y fiables, y
+favorecen al candidato más grave que explica el peine. Como Σ w_h = 1 y
+0 ≤ X̃ ≤ 1, S⁺ es una media ponderada y queda en [0, 1].
+
+**¿Por qué β castiga los errores de octava?** El candidato una octava arriba,
+2f₀, tiene armónicos {2f₀, 4f₀, 6f₀, ...}: todos son armónicos REALES de la
+nota f₀ (los pares). La suma armónica pura (β=0) no puede descartarlo y, si la
+fundamental es débil (algo muy habitual en el bajo: altavoces pequeños,
+micrófonos, fundamental ausente), puede incluso preferirlo. Pero sus
+posiciones inter-armónicas (h−½)·2f₀ = (2h−1)·f₀ = {f₀, 3f₀, 5f₀, ...} caen
+exactamente sobre los armónicos IMPARES de la nota real, que tienen mucha
+energía → S⁻ grande → β·S⁻ lo hunde. Para el candidato correcto f₀, las
+posiciones (h−½)·f₀ = {½f₀, 1½f₀, 2½f₀, ...} están entre picos y no tienen
+energía → S⁻ ≈ 0. El error contrario (una octava abajo, f₀/2) ya lo castiga
+S⁺: la mitad de su peine (los múltiplos impares de f₀/2) cae en zonas vacías.
+β = 0 recupera la suma armónica pura (ver ``tests/test_reward.py``).
+
+**¿Por qué el valor real μ se puede calcular exactamente?** El segmento tiene
+un número FINITO de frames y el entorno elige uno de forma uniforme. La
+recompensa del brazo a es una variable aleatoria discreta que toma el valor
+S_j(f_a) − pen_a con probabilidad 1/n_frames (más ruido de media cero), así
+que su esperanza es exactamente::
+
+    μ_a = E[r | a] = (1/n_frames) · Σ_j S_j(f_a) − pen_a
+
+Basta precalcular la matriz ``salience[frame, brazo]`` para obtener μ sin
+simulación. El agente NUNCA ve μ (solo muestras r); μ se usa como "oráculo"
+para medir el regret μ* − μ_{a_t} y el % de veces que se eligió el óptimo.
+
+**¿Qué distingue posiciones con el mismo pitch?** A-0 y E-5 suenan a la misma
+frecuencia (55.00 Hz y 41.20·2^(5/12) ≈ 54.995 Hz), así que tienen el mismo
+template armónico y —en cada frame— prácticamente la misma saliencia: el
+espectro no "sabe" en qué cuerda se tocó la nota. La única diferencia entre
+sus μ es la penalización de tocabilidad λ·|Δtraste|/12, que favorece la
+posición que exige MENOS movimiento de la mano respecto al traste previo.
+Con λ = 0 esas posiciones quedan (casi) empatadas.
+
+Eficiencia y números aleatorios comunes
+---------------------------------------
 Para que cada pull sea O(1) se precalcula, una sola vez por segmento, la
 matriz ``salience[frame, brazo]`` (:class:`SegmentBanditData`); el entorno
 (:class:`BanditEnvironment`) solo añade la penalización, que depende del
-traste previo elegido por el propio agente.
+traste previo elegido por el propio agente. Cada pull consume exactamente UNA
+llamada al generador para elegir el frame (y otra para el ruido solo si
+``noise_std > 0``), de modo que con la misma semilla todos los algoritmos ven
+la MISMA secuencia de frames aunque jalen brazos distintos (números
+aleatorios comunes): las diferencias entre algoritmos no se deben a la suerte.
 """
 
 from __future__ import annotations
 
+import logging
+import warnings
 from dataclasses import dataclass
 
 import numpy as np
 
 from src.config import OPEN_STRING_HZ, OPEN_STRING_MIDI, STRING_ORDER, EnvConfig
+from src.pitch import hz_to_midi
 from src.segmentation import Segment
+
+logger = logging.getLogger(__name__)
+
+#: Número de puntos uniformes (en semitonos) con que se explora la ventana de
+#: tolerancia ±``tolerance_semitones`` al leer X̃ en cada posición armónica.
+N_TOLERANCE_POINTS: int = 5
+
+#: Un frame cuyo máximo de magnitud no supera este valor se considera
+#: silencioso: no se normaliza (evita dividir entre ~0) y su saliencia es 0.
+SILENCE_FLOOR: float = 1e-10
+
+#: Tolerancia absoluta para considerar empatados dos valores reales μ.
+OPTIMAL_TOL: float = 1e-12
+
+#: Máximo de elementos de la matriz temporal (frames × consultas) que se
+#: materializa a la vez en :func:`salience_components` (acota la memoria).
+_MAX_GATHER_ELEMENTS: int = 2_000_000
 
 
 # ---------------------------------------------------------------------------
@@ -50,6 +137,14 @@ class Arm:
         ``"E"``, ``"A"``, ``"D"`` o ``"G"``.
     fret : int
         Traste (0 = cuerda al aire).
+
+    Examples
+    --------
+    >>> arm = Arm("A", 0)
+    >>> arm.label, arm.midi, arm.freq_hz
+    ('A-0', 33, 55.0)
+    >>> Arm("G", 12).freq_hz
+    196.0
     """
 
     string: str
@@ -77,13 +172,63 @@ class Arm:
 
 
 def fret_frequency(string: str, fret: int) -> float:
-    """f(cuerda, traste) = f_cuerda · 2^(traste/12) en Hz."""
+    """f(cuerda, traste) = f_cuerda · 2^(traste/12) en Hz.
+
+    Cada traste acorta la cuerda de modo que la frecuencia sube un semitono
+    temperado, es decir, se multiplica por 2^(1/12) ≈ 1.0595; 12 trastes
+    duplican la frecuencia (una octava).
+
+    Parameters
+    ----------
+    string : str
+        Cuerda (``"E"``, ``"A"``, ``"D"`` o ``"G"``).
+    fret : int
+        Traste (0 = cuerda al aire).
+
+    Returns
+    -------
+    float
+        Frecuencia fundamental en Hz.
+
+    Examples
+    --------
+    >>> fret_frequency("A", 0)
+    55.0
+    >>> round(fret_frequency("E", 5), 3)
+    54.995
+    >>> fret_frequency("A", 12)
+    110.0
+    """
     return float(OPEN_STRING_HZ[string] * 2.0 ** (fret / 12.0))
 
 
 def all_arms(n_frets: int = 12) -> list[Arm]:
-    """Las 4·(n_frets+1) posiciones, ordenadas por cuerda (E, A, D, G) y traste."""
-    raise NotImplementedError
+    """Las 4·(n_frets+1) posiciones, ordenadas por cuerda (E, A, D, G) y traste.
+
+    Parameters
+    ----------
+    n_frets : int
+        Traste máximo considerado (incluido). 12 → 52 brazos.
+
+    Returns
+    -------
+    list[Arm]
+        ``[E-0, E-1, ..., E-n, A-0, ..., G-n]``.
+
+    Raises
+    ------
+    ValueError
+        Si ``n_frets`` es negativo.
+
+    Examples
+    --------
+    >>> arms = all_arms()
+    >>> len(arms), arms[0].label, arms[13].label, arms[-1].label
+    (52, 'E-0', 'A-0', 'G-12')
+    """
+    if n_frets < 0:
+        raise ValueError(f"n_frets debe ser ≥ 0 (recibido {n_frets})")
+    return [Arm(string, fret) for string in STRING_ORDER for fret in range(n_frets + 1)]
 
 
 def candidate_arms(f0_hz: float | None, k: int | None, n_frets: int = 12) -> list[Arm]:
@@ -92,8 +237,55 @@ def candidate_arms(f0_hz: float | None, k: int | None, n_frets: int = 12) -> lis
     Si ``f0_hz`` es None o ``k`` es None devuelve :func:`all_arms`. Si la
     poda deja la lista vacía (f0 fuera del rango del bajo) también devuelve
     todos los brazos. Orden: por MIDI ascendente y luego por cuerda.
+
+    Parameters
+    ----------
+    f0_hz : float | None
+        f0 estimada del segmento en Hz (None = desconocida).
+    k : int | None
+        Radio de la poda en semitonos (None = sin poda).
+    n_frets : int
+        Traste máximo considerado.
+
+    Returns
+    -------
+    list[Arm]
+        Brazos candidatos, ordenados por (MIDI, cuerda de grave a aguda).
+
+    Raises
+    ------
+    ValueError
+        Si ``k`` es negativo.
+
+    Notes
+    -----
+    El objetivo es la nota temperada más cercana a la f0, ``round(midi(f0))``,
+    por lo que una f0 algo desafinada (±50 cents) sigue apuntando a su nota.
+    Con k = 0 quedan solo las posiciones de ese pitch (p. ej. A-0 y E-5 para
+    55 Hz); con k = 2 se admite que pYIN se equivoque hasta en un tono.
+
+    Examples
+    --------
+    >>> [a.label for a in candidate_arms(55.0, 0)]
+    ['E-5', 'A-0']
+    >>> len(candidate_arms(None, 2)), len(candidate_arms(55.0, None))
+    (52, 52)
     """
-    raise NotImplementedError
+    arms = all_arms(n_frets)
+    if f0_hz is None or k is None:
+        return arms
+    if k < 0:
+        raise ValueError(f"k_semitones debe ser ≥ 0 o None (recibido {k})")
+    if not np.isfinite(f0_hz) or f0_hz <= 0:
+        logger.debug("f0=%s no es válida; se usan los %d brazos", f0_hz, len(arms))
+        return arms
+    target = int(round(hz_to_midi(f0_hz)))
+    pruned = [a for a in arms if abs(a.midi - target) <= k]
+    if not pruned:
+        logger.debug("f0=%.1f Hz (MIDI %d) está fuera del rango del bajo; se usan los %d brazos",
+                     f0_hz, target, len(arms))
+        return arms
+    return sorted(pruned, key=lambda a: (a.midi, a.string_index))
 
 
 # ---------------------------------------------------------------------------
@@ -130,8 +322,73 @@ class Spectrum:
 
 
 def compute_spectrum(y: np.ndarray, sr: int, cfg: EnvConfig, hop_length: int = 256) -> Spectrum:
-    """Calcula la CQT (``cfg.spectrum == "cqt"``) o la STFT de ``y``."""
-    raise NotImplementedError
+    """Calcula la CQT (``cfg.spectrum == "cqt"``) o la STFT de ``y``.
+
+    Parameters
+    ----------
+    y : np.ndarray
+        Señal mono (normalizada, SIN el pasa-bajas: la recompensa necesita los
+        armónicos por encima de 400 Hz).
+    sr : int
+        Frecuencia de muestreo en Hz.
+    cfg : EnvConfig
+        Usa ``spectrum``, ``cqt_fmin_hz``, ``n_octaves``, ``bins_per_octave`` y
+        ``n_fft``.
+    hop_length : int
+        Salto entre frames en muestras (256 ≈ 11.6 ms a 22 050 Hz).
+
+    Returns
+    -------
+    Spectrum
+        Magnitud ``(n_bins, n_frames)`` en float32, frecuencias de cada bin y
+        tiempos (centro) de cada frame.
+
+    Raises
+    ------
+    ValueError
+        Si ``cfg.spectrum`` no es ``"cqt"`` ni ``"stft"``.
+
+    Notes
+    -----
+    * **CQT** (transformada de Q constante): bins espaciados
+      logarítmicamente, ``bins_per_octave`` por octava (36 = un tercio de
+      semitono), igual que las notas musicales. Cada armónico h·f cae siempre
+      en la misma posición relativa del eje, sea cual sea la nota.
+    * **STFT**: bins espaciados linealmente cada sr/n_fft Hz (≈ 5.4 Hz con
+      n_fft = 4096); en el registro grave del bajo (41–200 Hz) un semitono
+      ocupa solo 0.5–2 bins.
+
+    La saliencia lee el espectro interpolando sobre log2(frecuencia), así
+    que sirve para ambas representaciones sin cambios.
+    """
+    import librosa  # import diferido: librosa tarda en cargarse
+
+    kind = str(cfg.spectrum).lower()
+    if kind not in ("cqt", "stft"):
+        raise ValueError(f"Espectro desconocido: {cfg.spectrum!r} (use 'cqt' o 'stft')")
+    y = np.asarray(y, dtype=np.float32)
+    if kind == "cqt":
+        n_bins = cfg.n_octaves * cfg.bins_per_octave
+        with warnings.catch_warnings():
+            # La CQT de librosa submuestrea la señal una vez por octava; en clips
+            # de pocos segundos la versión más submuestreada es más corta que su
+            # FFT interna y librosa avisa "n_fft=... is too large". Es inocuo
+            # (se rellena con ceros), así que se silencia solo ese aviso.
+            warnings.filterwarnings("ignore", message=r"n_fft=\d+ is too large", category=UserWarning)
+            mag = np.abs(librosa.cqt(y=y, sr=sr, hop_length=hop_length, fmin=cfg.cqt_fmin_hz,
+                                     n_bins=n_bins, bins_per_octave=cfg.bins_per_octave))
+        freqs = librosa.cqt_frequencies(n_bins=n_bins, fmin=cfg.cqt_fmin_hz,
+                                        bins_per_octave=cfg.bins_per_octave)
+    else:
+        mag = np.abs(librosa.stft(y=y, n_fft=cfg.n_fft, hop_length=hop_length))
+        freqs = librosa.fft_frequencies(sr=sr, n_fft=cfg.n_fft)
+    mag = mag.astype(np.float32, copy=False)
+    times = librosa.times_like(mag, sr=sr, hop_length=hop_length)
+    logger.info("Espectro %s: %d bins (%.1f–%.1f Hz) × %d frames (hop=%d muestras = %.1f ms)",
+                kind.upper(), mag.shape[0], float(freqs[0]), float(freqs[-1]), mag.shape[1],
+                hop_length, 1000.0 * hop_length / sr)
+    return Spectrum(mag=mag, freqs_hz=np.asarray(freqs, dtype=float), times_s=np.asarray(times, dtype=float),
+                    hop_length=int(hop_length), sr=int(sr), kind=kind)
 
 
 # ---------------------------------------------------------------------------
@@ -162,8 +419,194 @@ class HarmonicTemplate:
 
 
 def harmonic_template(f0_hz: float, n_harmonics: int) -> HarmonicTemplate:
-    """Construye el template armónico de ``f0_hz`` (ver ecuaciones del encabezado)."""
-    raise NotImplementedError
+    """Construye el template armónico de ``f0_hz`` (ver ecuaciones del encabezado).
+
+    Parameters
+    ----------
+    f0_hz : float
+        Fundamental candidata f en Hz (> 0).
+    n_harmonics : int
+        Número N de armónicos, incluida la fundamental (≥ 1).
+
+    Returns
+    -------
+    HarmonicTemplate
+        Posiciones h·f (dientes del peine), (h−½)·f (huecos del peine) y
+        pesos w_h = (1/h) / Σ_k (1/k).
+
+    Raises
+    ------
+    ValueError
+        Si ``f0_hz`` ≤ 0 o ``n_harmonics`` < 1.
+
+    Notes
+    -----
+    Los huecos (h−½)·f son los puntos medios entre armónicos consecutivos
+    (h = 1 da ½·f, la "suboctava"). En un sonido armónico de fundamental f
+    allí no hay energía; si la hay, f probablemente no es la fundamental real
+    (ver "¿Por qué β castiga los errores de octava?" en el encabezado).
+
+    Examples
+    --------
+    >>> t = harmonic_template(55.0, 3)
+    >>> t.harmonic_hz.tolist(), t.interharmonic_hz.tolist()
+    ([55.0, 110.0, 165.0], [27.5, 82.5, 137.5])
+    >>> np.round(t.weights, 3).tolist()
+    [0.545, 0.273, 0.182]
+    """
+    if not np.isfinite(f0_hz) or f0_hz <= 0:
+        raise ValueError(f"La fundamental debe ser > 0 Hz (recibido {f0_hz})")
+    if n_harmonics < 1:
+        raise ValueError(f"n_harmonics debe ser ≥ 1 (recibido {n_harmonics})")
+    h = np.arange(1, n_harmonics + 1, dtype=float)
+    raw = 1.0 / h  # armónicos graves pesan más: son los más fuertes y fiables en el bajo
+    return HarmonicTemplate(
+        f0_hz=float(f0_hz),
+        harmonic_hz=h * f0_hz,
+        interharmonic_hz=(h - 0.5) * f0_hz,
+        weights=raw / raw.sum(),
+    )
+
+
+def _tolerance_offsets(tolerance_semitones: float, n_points: int) -> np.ndarray:
+    """Desplazamientos d (semitonos) uniformes en [−tol, +tol]; ``[0]`` si tol ≤ 0."""
+    if tolerance_semitones <= 0 or n_points <= 1:
+        return np.zeros(1)
+    return np.linspace(-tolerance_semitones, tolerance_semitones, n_points)
+
+
+def _log_interp_plan(freqs_hz: np.ndarray, query_hz: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Índices y pesos de interpolación lineal sobre el eje log2(frecuencia).
+
+    Para cada frecuencia consultada x se buscan los bins vecinos i0 < x ≤ i1
+    en log2(f) y el valor interpolado es ``w0·X[i0] + w1·X[i1]``. Las
+    consultas fuera del rango del espectro reciben w0 = w1 = 0 (valor 0).
+    Se ignoran los bins con frecuencia ≤ 0 (el bin DC de la STFT).
+
+    Parameters
+    ----------
+    freqs_hz : np.ndarray
+        Frecuencia de cada bin (Hz), creciente, forma ``(n_bins,)``.
+    query_hz : np.ndarray
+        Frecuencias a leer (Hz), cualquier forma.
+
+    Returns
+    -------
+    tuple of np.ndarray
+        ``(i0, i1, w0, w1)`` con la forma de ``query_hz``.
+    """
+    freqs_hz = np.asarray(freqs_hz, dtype=float)
+    valid = np.flatnonzero(freqs_hz > 0)
+    if valid.size < 2:
+        raise ValueError("El espectro necesita al menos 2 bins con frecuencia > 0 Hz")
+    log_f = np.log2(freqs_hz[valid])
+    query = np.asarray(query_hz, dtype=float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        log_q = np.where(query > 0, np.log2(np.where(query > 0, query, 1.0)), -np.inf)
+    in_range = (log_q >= log_f[0]) & (log_q <= log_f[-1])
+    pos = np.clip(np.searchsorted(log_f, log_q, side="right") - 1, 0, log_f.size - 2)
+    t = (log_q - log_f[pos]) / (log_f[pos + 1] - log_f[pos])
+    t = np.where(in_range, np.clip(t, 0.0, 1.0), 0.0)
+    w0 = np.where(in_range, 1.0 - t, 0.0)
+    w1 = t
+    return valid[pos], valid[pos + 1], w0, w1
+
+
+def salience_components(
+    frames_mag: np.ndarray,
+    freqs_hz: np.ndarray,
+    arm_freqs_hz: np.ndarray,
+    cfg: EnvConfig,
+    n_tolerance_points: int = N_TOLERANCE_POINTS,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Energía armónica S⁺ y energía inter-armónica S⁻ de cada frame y candidato.
+
+    Es el núcleo de :func:`salience`, expuesto por separado para poder
+    graficar/explicar ambos términos.
+
+    Parameters
+    ----------
+    frames_mag : np.ndarray
+        Magnitudes sin normalizar, forma ``(n_bins, n_frames)`` (o ``(n_bins,)``
+        para un único frame).
+    freqs_hz : np.ndarray
+        Frecuencia de cada bin (Hz), creciente, forma ``(n_bins,)``.
+    arm_freqs_hz : np.ndarray
+        Fundamentales candidatas (Hz), forma ``(n_arms,)``.
+    cfg : EnvConfig
+        Usa ``n_harmonics`` y ``tolerance_semitones``.
+    n_tolerance_points : int
+        Puntos con que se explora la ventana ±tolerancia (5 por defecto).
+
+    Returns
+    -------
+    s_plus, s_minus : np.ndarray
+        Ambas de forma ``(n_frames, n_arms)`` con valores en [0, 1].
+
+    Raises
+    ------
+    ValueError
+        Si las formas no son coherentes o alguna frecuencia candidata es ≤ 0.
+
+    Notes
+    -----
+    Implementación vectorizada en tres pasos:
+
+    1. **Normalización por frame**: X̃_j = |X_j| / max|X_j|. Así la
+       saliencia no depende del volumen de la nota (un frame suave y uno
+       fuerte con el mismo timbre dan la misma saliencia). Los frames con
+       máximo ≤ :data:`SILENCE_FLOOR` se dejan en 0 (saliencia 0).
+    2. **Plan de lectura** (independiente de los frames): para cada
+       (brazo, armónico o hueco, punto de tolerancia) se calcula la
+       frecuencia x·2^(d/12), d ∈ [−tol, +tol], y sus índices/pesos de
+       interpolación sobre log2(f). Leer "el máximo dentro de ±tol"
+       absorbe la desafinación y la inarmonicidad de las cuerdas reales
+       (los armónicos de una cuerda gruesa salen ligeramente agudos).
+    3. **Gather**: una sola indexación avanzada lee todas las posiciones de
+       todos los frames a la vez; luego máximo sobre los puntos de
+       tolerancia y suma ponderada sobre h con los pesos w_h.
+    """
+    mag = np.asarray(frames_mag, dtype=np.float64)
+    if mag.ndim == 1:
+        mag = mag[:, None]
+    freqs_hz = np.asarray(freqs_hz, dtype=float)
+    if mag.ndim != 2 or mag.shape[0] != freqs_hz.shape[0]:
+        raise ValueError(f"frames_mag debe tener forma (n_bins={freqs_hz.shape[0]}, n_frames); "
+                         f"recibida {mag.shape}")
+    arm_freqs = np.atleast_1d(np.asarray(arm_freqs_hz, dtype=float))
+    n_frames, n_arms = mag.shape[1], arm_freqs.shape[0]
+    if n_frames == 0 or n_arms == 0:
+        empty = np.zeros((n_frames, n_arms))
+        return empty, empty.copy()
+
+    # 1) Normalización por el máximo de cada frame (frames silenciosos → 0).
+    peak = mag.max(axis=0)
+    silent = peak <= SILENCE_FLOOR
+    norm = mag / np.where(silent, 1.0, peak)
+    norm[:, silent] = 0.0
+
+    # 2) Plan de lectura: posiciones (brazo, {armónico, hueco}, h, punto).
+    templates = [harmonic_template(float(f), cfg.n_harmonics) for f in arm_freqs]
+    weights = templates[0].weights  # w_h depende solo de h y N: igual para todos los brazos
+    centers = np.stack([np.stack([t.harmonic_hz, t.interharmonic_hz]) for t in templates])  # (A, 2, H)
+    offsets = _tolerance_offsets(cfg.tolerance_semitones, n_tolerance_points)  # (P,) semitonos
+    query = centers[..., None] * 2.0 ** (offsets / 12.0)  # (A, 2, H, P) en Hz
+    i0, i1, w0, w1 = _log_interp_plan(freqs_hz, query.ravel())
+    shape = (n_arms, 2, cfg.n_harmonics, offsets.size)
+
+    # 3) Gather por bloques de frames (acota la memoria en pistas largas).
+    frames_first = np.ascontiguousarray(norm.T)  # (n_frames, n_bins)
+    energy = np.empty((n_frames, n_arms, 2))
+    chunk = max(1, _MAX_GATHER_ELEMENTS // i0.size)
+    for start in range(0, n_frames, chunk):
+        block = frames_first[start:start + chunk]
+        values = block[:, i0] * w0 + block[:, i1] * w1        # X̃(x·2^(d/12)) interpolado
+        values = values.reshape((block.shape[0],) + shape)
+        best = values.max(axis=-1)                             # máximo dentro de ±tolerancia
+        energy[start:start + chunk] = best @ weights           # Σ_h w_h · X̃(...)
+    s_plus = np.clip(energy[..., 0], 0.0, 1.0)
+    s_minus = np.clip(energy[..., 1], 0.0, 1.0)
+    return s_plus, s_minus
 
 
 def salience(frames_mag: np.ndarray, freqs_hz: np.ndarray, arm_freqs_hz: np.ndarray, cfg: EnvConfig) -> np.ndarray:
@@ -185,13 +628,64 @@ def salience(frames_mag: np.ndarray, freqs_hz: np.ndarray, arm_freqs_hz: np.ndar
     -------
     np.ndarray
         Forma ``(n_frames, n_arms)``, valores en [0, 1].
+
+    Notes
+    -----
+    S = max(S⁺ − β·S⁻, 0): energía en los armónicos h·f menos β veces la
+    energía en los huecos (h−½)·f (ver :func:`salience_components`). El
+    recorte en 0 mantiene la recompensa en [0, 1] aunque un candidato muy
+    malo tenga más energía en los huecos que en los dientes de su peine.
+
+    Examples
+    --------
+    Espectro "de juguete" con picos en 55, 110 y 165 Hz (nota A1):
+
+    >>> freqs = np.arange(1.0, 1001.0)                # 1 Hz por bin
+    >>> mag = np.zeros((freqs.size, 1))
+    >>> mag[[54, 109, 164], 0] = [1.0, 0.5, 0.25]     # bins de 55, 110, 165 Hz
+    >>> cfg = EnvConfig(n_harmonics=3, beta=0.5, tolerance_semitones=0.0)
+    >>> s = salience(mag, freqs, np.array([55.0, 110.0]), cfg)
+    >>> s.shape, round(float(s[0, 0]), 3), round(float(s[0, 1]), 3)
+    ((1, 2), 0.727, 0.0)
     """
-    raise NotImplementedError
+    s_plus, s_minus = salience_components(frames_mag, freqs_hz, arm_freqs_hz, cfg)
+    return np.maximum(s_plus - cfg.beta * s_minus, 0.0)
 
 
 def playability_penalty(frets: np.ndarray, prev_fret: int | None, lam: float) -> np.ndarray:
-    """λ·|traste − traste_previo|/12 por brazo (0 si ``prev_fret`` es None)."""
-    raise NotImplementedError
+    """λ·|traste − traste_previo|/12 por brazo (0 si ``prev_fret`` es None).
+
+    Parameters
+    ----------
+    frets : np.ndarray
+        Traste de cada brazo, forma ``(K,)``.
+    prev_fret : int | None
+        Posición previa de la mano (traste); None = sin información.
+    lam : float
+        Peso λ (adimensional; un desplazamiento de 12 trastes cuesta λ).
+
+    Returns
+    -------
+    np.ndarray
+        Penalización de cada brazo, forma ``(K,)``, float.
+
+    Notes
+    -----
+    Modela la tocabilidad: saltar muchos trastes entre notas consecutivas es
+    incómodo. Dividir por 12 expresa el salto en octavas del mástil, de modo
+    que λ está en la misma escala que la saliencia (∈ [0, 1]).
+
+    Examples
+    --------
+    >>> np.round(playability_penalty(np.array([0, 5, 7]), 5, 0.12), 3).tolist()
+    [0.05, 0.0, 0.02]
+    >>> playability_penalty(np.array([0, 5]), None, 0.12).tolist()
+    [0.0, 0.0]
+    """
+    frets = np.asarray(frets, dtype=float)
+    if prev_fret is None:
+        return np.zeros(frets.shape, dtype=float)
+    return lam * np.abs(frets - float(prev_fret)) / 12.0
 
 
 # ---------------------------------------------------------------------------
@@ -241,14 +735,96 @@ class SegmentBanditData:
         return np.array([a.fret for a in self.arms], dtype=int)
 
 
+def _segment_frame_indices(times_s: np.ndarray, segment: Segment, attack_skip_s: float) -> np.ndarray:
+    """Frames del espectro que representan la nota (siempre al menos uno).
+
+    1. Frames con tiempo en [inicio + attack_skip, fin): la nota ya estable,
+       sin el ataque percusivo de la púa/dedo.
+    2. Si no hay ninguno (nota muy corta): frames en [inicio, fin).
+    3. Si tampoco: el frame más cercano al centro del segmento.
+    """
+    times_s = np.asarray(times_s, dtype=float)
+    idx = np.flatnonzero((times_s >= segment.start_s + attack_skip_s) & (times_s < segment.end_s))
+    if idx.size == 0:
+        idx = np.flatnonzero((times_s >= segment.start_s) & (times_s < segment.end_s))
+    if idx.size == 0:
+        center = 0.5 * (segment.start_s + segment.end_s)
+        idx = np.array([int(np.argmin(np.abs(times_s - center)))])
+    return idx.astype(int)
+
+
+def _format_arm_list(arms: list[Arm], max_shown: int = 8) -> str:
+    """``"A-0, E-5, …"``: etiquetas de los primeros ``max_shown`` brazos."""
+    labels = [a.label for a in arms[:max_shown]]
+    if len(arms) > max_shown:
+        labels.append("…")
+    return ", ".join(labels)
+
+
 def build_segment_data(spectrum: Spectrum, segment: Segment, position: int, cfg: EnvConfig) -> SegmentBanditData:
-    """Precalcula brazos candidatos y matriz de saliencia de un segmento conservado."""
-    raise NotImplementedError
+    """Precalcula brazos candidatos y matriz de saliencia de un segmento conservado.
+
+    Parameters
+    ----------
+    spectrum : Spectrum
+        Espectro de toda la pista.
+    segment : Segment
+        Segmento conservado (usa ``start_s``, ``end_s`` y ``f0_hz``).
+    position : int
+        Posición del segmento entre los conservados.
+    cfg : EnvConfig
+        Usa ``k_semitones``, ``n_frets``, ``attack_skip_s`` y los parámetros
+        de la saliencia (``n_harmonics``, ``beta``, ``tolerance_semitones``).
+
+    Returns
+    -------
+    SegmentBanditData
+        Brazos candidatos, frames usados y matriz ``salience[frame, brazo]``.
+
+    Notes
+    -----
+    Es el ÚNICO paso costoso por segmento: después, cada pull del bandit
+    es una simple lectura de esta matriz.
+    """
+    frame_idx = _segment_frame_indices(spectrum.times_s, segment, cfg.attack_skip_s)
+    arms = candidate_arms(segment.f0_hz, cfg.k_semitones, cfg.n_frets)
+    arm_freqs = np.array([a.freq_hz for a in arms])
+    sal = salience(spectrum.mag[:, frame_idx], spectrum.freqs_hz, arm_freqs, cfg)
+    data = SegmentBanditData(segment=segment, position=position, arms=arms,
+                             frame_indices=frame_idx, salience=sal)
+    means = data.mean_salience
+    best = int(np.argmax(means))
+    f0_text = "desconocida" if segment.f0_hz is None else f"{segment.f0_hz:.1f} Hz"
+    logger.info("Segmento %d: f0=%s, %d brazos candidatos (%s), mejor saliencia media: %s (%.2f)",
+                position, f0_text, len(arms), _format_arm_list(arms), arms[best].label, float(means[best]))
+    logger.debug("Segmento %d: %d frames (%.3f–%.3f s) usados para la recompensa",
+                 position, frame_idx.size, float(spectrum.times_s[frame_idx[0]]),
+                 float(spectrum.times_s[frame_idx[-1]]))
+    return data
 
 
 def build_all_segment_data(spectrum: Spectrum, segments: list[Segment], cfg: EnvConfig) -> list[SegmentBanditData]:
-    """:func:`build_segment_data` para cada segmento con ``kept=True``, en orden."""
-    raise NotImplementedError
+    """:func:`build_segment_data` para cada segmento con ``kept=True``, en orden.
+
+    Parameters
+    ----------
+    spectrum : Spectrum
+        Espectro de toda la pista.
+    segments : list[Segment]
+        Todos los segmentos (los descartados se omiten).
+    cfg : EnvConfig
+        Configuración del entorno.
+
+    Returns
+    -------
+    list[SegmentBanditData]
+        Uno por segmento conservado, con ``position`` = 0, 1, 2, ...
+    """
+    kept = [s for s in segments if s.kept]
+    data = [build_segment_data(spectrum, seg, pos, cfg) for pos, seg in enumerate(kept)]
+    logger.info("Datos bandit precalculados para %d segmentos conservados (de %d detectados)",
+                len(kept), len(segments))
+    return data
 
 
 @dataclass
@@ -308,6 +884,24 @@ class BanditEnvironment:
         Índices de los brazos con μ máximo (empates con tolerancia 1e-12).
     best_mean : float
         μ* = max μ_a.
+    gaps : np.ndarray
+        Brecha de cada brazo Δ_a = μ* − μ_a ≥ 0, forma ``(K,)`` (regret por pull).
+
+    Notes
+    -----
+    La distribución de recompensas del brazo a es la distribución empírica
+    de {S_j(f_a) − pen_a} sobre los frames j del segmento (cada uno con
+    probabilidad 1/n_frames), más ruido N(0, σ²) opcional. Por eso
+    μ_a = media_j S_j(f_a) − pen_a es EXACTO (ver encabezado del módulo).
+
+    Examples
+    --------
+    >>> seg = Segment(index=0, start_s=0.0, end_s=1.0, start_sample=0, end_sample=22050, rms_db=0.0)
+    >>> data = SegmentBanditData(seg, 0, [Arm("E", 5), Arm("A", 0)], np.arange(2),
+    ...                          np.array([[0.8, 0.8], [0.6, 0.6]]))
+    >>> env = BanditEnvironment(data, prev_fret=5, lam=0.12, rng=np.random.default_rng(0))
+    >>> env.true_means.round(3).tolist(), env.optimal_arms.tolist()
+    ([0.7, 0.65], [0])
     """
 
     def __init__(
@@ -319,7 +913,43 @@ class BanditEnvironment:
         noise_std: float = 0.0,
         open_string_free: bool = False,
     ) -> None:
-        raise NotImplementedError
+        if data.salience.ndim != 2 or data.salience.shape[0] < 1 or data.salience.shape[1] != data.n_arms:
+            raise ValueError(f"La matriz de saliencia debe tener forma (n_frames ≥ 1, K={data.n_arms}); "
+                             f"recibida {data.salience.shape}")
+        if noise_std < 0:
+            raise ValueError(f"noise_std debe ser ≥ 0 (recibido {noise_std})")
+        self.data = data
+        self.prev_fret = prev_fret
+        self.lam = float(lam)
+        self.rng = rng
+        self.noise_std = float(noise_std)
+        self.open_string_free = bool(open_string_free)
+
+        frets = data.frets
+        penalties = playability_penalty(frets, prev_fret, self.lam)
+        if self.open_string_free:
+            # Extensión opcional: tocar al aire no obliga a mover la mano.
+            penalties[frets == 0] = 0.0
+        self.penalties: np.ndarray = penalties
+
+        # Valor real de cada brazo (lo conoce el entorno, NUNCA el agente):
+        #   μ_a = (1/n_frames)·Σ_j S_j(f_a) − pen_a
+        self.true_means: np.ndarray = data.mean_salience - penalties
+        self.best_mean: float = float(self.true_means.max())
+        self.optimal_arms: np.ndarray = np.flatnonzero(self.true_means >= self.best_mean - OPTIMAL_TOL)
+        # Brecha Δ_a = μ* − μ_a: el pseudo-regret que cuesta jalar a (0 para los óptimos).
+        self.gaps: np.ndarray = np.maximum(self.best_mean - self.true_means, 0.0)
+        self.gaps[self.optimal_arms] = 0.0
+        self._optimal_mask = np.zeros(data.n_arms, dtype=bool)
+        self._optimal_mask[self.optimal_arms] = True
+
+        # Atajos para que pull() sea O(1) sin indirecciones.
+        self._salience = data.salience
+        self._n_frames = int(data.salience.shape[0])
+        self._n_arms = int(data.n_arms)
+        logger.debug("Entorno del segmento %d: K=%d, %d frames, traste previo=%s, μ*=%.3f, óptimos=%s",
+                     data.position, self._n_arms, self._n_frames, prev_fret, self.best_mean,
+                     [data.arms[i].label for i in self.optimal_arms])
 
     @classmethod
     def from_config(
@@ -331,23 +961,94 @@ class BanditEnvironment:
     @property
     def n_arms(self) -> int:
         """Número de brazos K."""
-        raise NotImplementedError
+        return self._n_arms
+
+    @property
+    def arms(self) -> list[Arm]:
+        """Brazos candidatos del segmento (atajo a ``data.arms``)."""
+        return self.data.arms
+
+    def _check_arm(self, arm_index: int) -> int:
+        """Valida el índice de brazo (0..K−1) y lo devuelve como ``int``."""
+        a = int(arm_index)
+        if not 0 <= a < self._n_arms:
+            raise IndexError(f"Brazo {arm_index} fuera de rango (K={self._n_arms})")
+        return a
+
+    def _sample(self, a: int) -> tuple[int, float, float]:
+        """Muestrea (frame j, S_j(f_a), ruido) consumiendo el rng siempre igual.
+
+        La primera llamada al generador elige el frame, sea cual sea el brazo:
+        así dos algoritmos con la misma semilla ven la misma secuencia de
+        frames (números aleatorios comunes). El ruido, si existe, es la
+        segunda llamada.
+        """
+        j = int(self.rng.integers(self._n_frames))
+        noise = float(self.rng.normal(0.0, self.noise_std)) if self.noise_std > 0 else 0.0
+        return j, float(self._salience[j, a]), noise
 
     def pull(self, arm_index: int) -> float:
-        """Jala el brazo y devuelve solo la recompensa (camino rápido para experimentos)."""
-        raise NotImplementedError
+        """Jala el brazo y devuelve solo la recompensa (camino rápido para experimentos).
+
+        Parameters
+        ----------
+        arm_index : int
+            Índice del brazo (0..K−1).
+
+        Returns
+        -------
+        float
+            r = S_j(f_a) − pen_a (+ ruido), con j uniforme entre los frames.
+
+        Raises
+        ------
+        IndexError
+            Si el índice está fuera de rango.
+        """
+        a = self._check_arm(arm_index)
+        _, s, noise = self._sample(a)
+        return s - float(self.penalties[a]) + noise
 
     def pull_detailed(self, arm_index: int) -> PullResult:
-        """Jala el brazo y devuelve el detalle completo (frame, saliencia, penalización)."""
-        raise NotImplementedError
+        """Jala el brazo y devuelve el detalle completo (frame, saliencia, penalización).
+
+        Consume el generador exactamente igual que :meth:`pull`, así que
+        ambos producen la misma secuencia de recompensas con la misma semilla.
+
+        Parameters
+        ----------
+        arm_index : int
+            Índice del brazo (0..K−1).
+
+        Returns
+        -------
+        PullResult
+            Recompensa y sus componentes.
+        """
+        a = self._check_arm(arm_index)
+        j, s, noise = self._sample(a)
+        pen = float(self.penalties[a])
+        return PullResult(arm_index=a, reward=s - pen + noise, frame_index=j,
+                          salience=s, penalty=pen, noise=noise)
 
     def regret_of(self, arm_index: int) -> float:
-        """Pseudo-regret instantáneo μ* − μ_a (≥ 0)."""
-        raise NotImplementedError
+        """Pseudo-regret instantáneo μ* − μ_a (≥ 0).
+
+        Parameters
+        ----------
+        arm_index : int
+            Índice del brazo.
+
+        Returns
+        -------
+        float
+            0 para los brazos óptimos; Δ_a > 0 para los demás.
+        """
+        return float(self.gaps[self._check_arm(arm_index)])
 
     def is_optimal(self, arm_index: int) -> bool:
         """True si ``arm_index`` está entre los brazos óptimos."""
-        raise NotImplementedError
+        return bool(self._optimal_mask[self._check_arm(arm_index)])
 
 
 def next_hand_fret(arm: Arm, prev_fret: int | None, cfg: EnvConfig) -> int | None:
@@ -355,13 +1056,38 @@ def next_hand_fret(arm: Arm, prev_fret: int | None, cfg: EnvConfig) -> int | Non
 
     Normalmente es ``arm.fret``; si ``cfg.open_string_free`` y el brazo es una
     cuerda al aire, la mano se queda en ``prev_fret``.
+
+    Parameters
+    ----------
+    arm : Arm
+        Posición recién tocada.
+    prev_fret : int | None
+        Posición de la mano antes de tocarla.
+    cfg : EnvConfig
+        Usa ``open_string_free``.
+
+    Returns
+    -------
+    int | None
+        Traste previo para el siguiente segmento.
+
+    Examples
+    --------
+    >>> next_hand_fret(Arm("A", 0), 5, EnvConfig())
+    0
+    >>> next_hand_fret(Arm("A", 0), 5, EnvConfig(open_string_free=True))
+    5
+    >>> next_hand_fret(Arm("D", 3), 5, EnvConfig(open_string_free=True))
+    3
     """
-    raise NotImplementedError
+    if cfg.open_string_free and arm.fret == 0:
+        return prev_fret
+    return arm.fret
 
 
 __all__ = [
     "Arm", "fret_frequency", "all_arms", "candidate_arms", "Spectrum", "compute_spectrum",
-    "HarmonicTemplate", "harmonic_template", "salience", "playability_penalty",
+    "HarmonicTemplate", "harmonic_template", "salience", "salience_components", "playability_penalty",
     "SegmentBanditData", "build_segment_data", "build_all_segment_data", "PullResult",
-    "BanditEnvironment", "next_hand_fret",
+    "BanditEnvironment", "next_hand_fret", "N_TOLERANCE_POINTS", "SILENCE_FLOOR", "OPTIMAL_TOL",
 ]
