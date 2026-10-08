@@ -7,3 +7,9 @@ soundfile>=0.12
 matplotlib>=3.8
 pretty_midi>=0.2.10
 pytest>=8.0
+# Reproducción de audio desde la GUI (escuchar el original y la tablatura sintetizada).
+# En Windows y macOS la rueda de pip ya incluye PortAudio; en Linux instala además la
+# biblioteca del sistema:  sudo apt install libportaudio2   (Fedora: portaudio).
+# Sin ella la GUI funciona, pero sin reproducción integrada (la tablatura se abre con el
+# reproductor del sistema).
+sounddevice>=0.4.6

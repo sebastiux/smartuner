@@ -6,8 +6,33 @@ Es la salida final del sistema. Cada segmento conservado fue un problema
 bandit independiente y su agente recomendó un brazo (cuerda, traste); este
 módulo empareja cada segmento con su brazo (:func:`notes_from_choices`), lo
 dibuja como una tablatura de bajo de 4 líneas (G, D, A, E de arriba abajo)
-con marcas de tiempo (:func:`render_ascii`) y la exporta a TXT, JSON y CSV
-(:func:`export_tab`).
+con marcas de tiempo (:func:`render_ascii`) y la exporta a TXT, JSON, CSV y
+MIDI (:func:`export_tab`).
+
+Escuchar la tablatura
+---------------------
+Para comprobar DE OÍDO si la transcripción es correcta, la tablatura se
+convierte en un MIDI (:func:`notes_to_midi`, GM 33 = bajo eléctrico con
+dedos, tiempos absolutos de cada segmento), se sintetiza
+(:func:`render_notes`: fluidsynth + soundfont si están instalados, si no
+Karplus-Strong en numpy) y se combina con el audio original
+(:func:`playback_mix`) para compararlos::
+
+    list[TabNote] ──► render_notes() ──► síntesis (mono, MISMOS tiempos que el original)
+                                              │
+    audio original (y_raw) ──────────────────┼──► playback_mix(modo)
+                                              ▼
+            "midi"      solo la síntesis           (¿suena como el bajo?)
+            "original"  solo el original           (referencia)
+            "mezcla"    ambos sumados, misma sonoridad (los errores de pitch «chocan»)
+            "estereo"   original a la IZQUIERDA, síntesis a la DERECHA (A/B con auriculares)
+
+Como la síntesis conserva los tiempos absolutos de los segmentos, en la
+mezcla cada nota transcrita suena a la vez que la real: un pitch
+equivocado se oye como una disonancia (batido) y un onset desplazado,
+como un eco. La síntesis solo depende del pitch (``midi``) y de los
+tiempos: dos posiciones con la misma nota (A-0 y E-5) suenan igual, así
+que de oído se juzga el pitch y el ritmo, no la elección de cuerda.
 
 Formato ASCII
 -------------
@@ -38,14 +63,34 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import tempfile
+import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+import numpy as np
 
 from src.config import STRING_ORDER
 from src.environment import Arm
 from src.pitch import midi_to_name
 from src.segmentation import Segment
+from src.synth_dataset import (
+    BASS_PROGRAM,
+    METHODS,
+    OUTPUT_PEAK,
+    TAIL_S,
+    GTNote,
+    _finish_audio,
+    _load_wav_mono,
+    _resolve_method,
+    render_fluidsynth,
+    render_karplus_strong,
+)
+
+if TYPE_CHECKING:  # solo para anotaciones: pretty_midi se importa de forma diferida
+    import pretty_midi
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +105,44 @@ TIME_DECIMALS: int = 2
 
 #: Columnas del CSV exportado (en este orden).
 CSV_COLUMNS: tuple[str, ...] = ("position", "start_s", "end_s", "string", "fret", "midi", "note", "f0_hz")
+
+#: Extensiones que :func:`export_tab` guarda como archivo MIDI.
+MIDI_SUFFIXES: tuple[str, ...] = (".mid", ".midi")
+
+#: Programa General MIDI (numeración 0–127) del MIDI exportado: 33 = "Electric Bass (finger)".
+MIDI_PROGRAM: int = BASS_PROGRAM
+
+#: Ticks por negra del MIDI. Un archivo MIDI guarda los tiempos en ticks, no en
+#: segundos: a 120 bpm, 960 ticks/negra dan 0.52 ms por tick, así que el
+#: redondeo a ticks es inaudible y la síntesis no se desalinea del original
+#: (con los 220 ticks por defecto de pretty_midi el paso sería de 2.3 ms).
+MIDI_RESOLUTION: int = 960
+
+#: Tempo (bpm) guardado en el MIDI. Es solo la escala de los ticks: los
+#: tiempos de las notas ya están en segundos y no dependen de él.
+MIDI_TEMPO_BPM: float = 120.0
+
+#: Duración mínima (s) de una nota en el MIDI: una nota de duración 0 la
+#: descartan algunos lectores y fluidsynth no la haría sonar.
+MIN_MIDI_NOTE_S: float = 0.01
+
+#: Métodos de síntesis de :func:`render_notes` (los mismos que el dataset sintético).
+SYNTH_METHODS: tuple[str, ...] = METHODS
+
+#: Modos de :func:`playback_mix`, en el orden en que se ofrecen en la GUI.
+PLAYBACK_MODES: tuple[str, ...] = ("midi", "original", "mezcla", "estereo")
+
+#: Nombre legible de cada modo de reproducción (botones y menús de la GUI).
+PLAYBACK_MODE_LABELS: dict[str, str] = {
+    "midi": "MIDI",
+    "original": "Original",
+    "mezcla": "Mezcla",
+    "estereo": "A/B estéreo",
+}
+
+#: Pico (escala completa = 1) al que :func:`playback_mix` normaliza la salida:
+#: deja ~1 dB de margen para que el conversor de la tarjeta no sature.
+PLAYBACK_PEAK: float = OUTPUT_PEAK
 
 
 @dataclass
@@ -430,17 +513,18 @@ def export_csv(notes: list[TabNote], path: str | Path) -> Path:
 
 
 def export_tab(notes: list[TabNote], path: str | Path, meta: dict | None = None) -> Path:
-    """Exporta según la extensión de ``path`` (.txt, .json o .csv).
+    """Exporta según la extensión de ``path`` (.txt, .json, .csv o .mid).
 
     Parameters
     ----------
     notes : list[TabNote]
         Notas de la tablatura.
     path : str | Path
-        Archivo de salida; su extensión (sin distinguir mayúsculas) decide el formato.
+        Archivo de salida; su extensión (sin distinguir mayúsculas) decide el
+        formato. ``.mid`` (o ``.midi``) guarda el MIDI de :func:`export_midi`.
     meta : dict | None, optional
         Metadatos: van al JSON completos; en el TXT se usa ``meta["title"]``
-        o un resumen de una línea como título; el CSV los ignora.
+        o un resumen de una línea como título; el CSV y el MIDI los ignoran.
 
     Returns
     -------
@@ -450,7 +534,7 @@ def export_tab(notes: list[TabNote], path: str | Path, meta: dict | None = None)
     Raises
     ------
     ValueError
-        Si la extensión no es ``.txt``, ``.json`` ni ``.csv``.
+        Si la extensión no es ``.txt``, ``.json``, ``.csv`` ni ``.mid``.
     """
     path = Path(path)
     suffix = path.suffix.lower()
@@ -460,4 +544,392 @@ def export_tab(notes: list[TabNote], path: str | Path, meta: dict | None = None)
         return export_json(notes, path, meta=meta)
     if suffix == ".csv":
         return export_csv(notes, path)
-    raise ValueError(f"Formato de tablatura no soportado: «{path.suffix}». Usa .txt, .json o .csv.")
+    if suffix in MIDI_SUFFIXES:
+        return export_midi(notes, path)
+    raise ValueError(f"Formato de tablatura no soportado: «{path.suffix}». Usa .txt, .json, .csv o .mid.")
+
+
+# ---------------------------------------------------------------------------
+# MIDI: la tablatura como partitura que se puede escuchar
+# ---------------------------------------------------------------------------
+
+
+def notes_to_midi(notes: Sequence[TabNote], program: int = MIDI_PROGRAM, velocity: int = 100) -> pretty_midi.PrettyMIDI:
+    """Convierte la tablatura en un MIDI de un solo instrumento (tiempos absolutos en s).
+
+    Cada :class:`TabNote` se vuelve una nota MIDI con su pitch (``midi``) que
+    empieza en ``start_s`` y termina en ``end_s``: los MISMOS instantes del
+    segmento en el audio original, así que la síntesis queda alineada con él.
+    El MIDI solo guarda pitch y tiempos; la posición (cuerda, traste) se
+    añade como letra (*lyric*) en el inicio de cada nota (``"A-0"``), que
+    muchos reproductores MIDI muestran sincronizada con la música.
+
+    Parameters
+    ----------
+    notes : Sequence[TabNote]
+        Notas de la tablatura (en cualquier orden; se escriben ordenadas por inicio).
+    program : int, optional
+        Programa General MIDI en numeración 0–127 (33 = Electric Bass (finger)).
+    velocity : int, optional
+        Intensidad 1–127 de todas las notas (la tablatura no estima dinámica).
+
+    Returns
+    -------
+    pretty_midi.PrettyMIDI
+        Objeto en memoria (guárdalo con ``pm.write(ruta)`` o :func:`export_midi`)
+        con :data:`MIDI_RESOLUTION` ticks por negra y un instrumento.
+
+    Raises
+    ------
+    ValueError
+        Si ``program``, ``velocity`` o el ``midi`` de alguna nota están fuera de rango.
+
+    Examples
+    --------
+    >>> pm = notes_to_midi([TabNote(0, 0.5, 0.8, "A", 0, 33), TabNote(1, 0.8, 1.1, "D", 2, 40)])
+    >>> [(n.pitch, round(n.start, 3), round(n.end, 3)) for n in pm.instruments[0].notes]
+    [(33, 0.5, 0.8), (40, 0.8, 1.1)]
+    >>> pm.instruments[0].program, [lyric.text for lyric in pm.lyrics]
+    (33, ['A-0', 'D-2'])
+    """
+    import pretty_midi  # import diferido: solo se necesita al exportar o escuchar
+
+    if not 0 <= int(program) <= 127:
+        raise ValueError(f"Programa MIDI fuera de rango: {program} (debe estar entre 0 y 127).")
+    if not 1 <= int(velocity) <= 127:
+        raise ValueError(f"Velocidad MIDI fuera de rango: {velocity} (debe estar entre 1 y 127).")
+    pm = pretty_midi.PrettyMIDI(resolution=MIDI_RESOLUTION, initial_tempo=MIDI_TEMPO_BPM)
+    instrument = pretty_midi.Instrument(program=int(program), name=pretty_midi.program_to_instrument_name(int(program)))
+    for note in sorted(notes, key=lambda n: (n.start_s, n.position)):
+        if not 0 <= int(note.midi) <= 127:
+            raise ValueError(f"Nota {note.position}: MIDI {note.midi} fuera de rango (0–127).")
+        start = max(0.0, float(note.start_s))
+        end = max(float(note.end_s), start + MIN_MIDI_NOTE_S)
+        instrument.notes.append(pretty_midi.Note(velocity=int(velocity), pitch=int(note.midi), start=start, end=end))
+        pm.lyrics.append(pretty_midi.Lyric(text=note.label, time=start))
+    pm.instruments.append(instrument)
+    logger.debug("MIDI en memoria: %d notas, programa %d, %d ticks/negra", len(instrument.notes), program,
+                 MIDI_RESOLUTION)
+    return pm
+
+
+def export_midi(notes: Sequence[TabNote], path: str | Path, program: int = MIDI_PROGRAM, velocity: int = 100) -> Path:
+    """Guarda la tablatura como archivo MIDI estándar (``.mid``).
+
+    El archivo se abre con cualquier reproductor o editor MIDI (MuseScore,
+    Guitar Pro, un DAW...) para escuchar la transcripción o seguir editándola.
+
+    Parameters
+    ----------
+    notes : Sequence[TabNote]
+        Notas de la tablatura.
+    path : str | Path
+        Archivo de salida (se crean las carpetas intermedias).
+    program : int, optional
+        Programa General MIDI 0–127 (33 = Electric Bass (finger)).
+    velocity : int, optional
+        Intensidad 1–127 de todas las notas.
+
+    Returns
+    -------
+    Path
+        Ruta escrita.
+
+    Examples
+    --------
+    >>> export_midi([TabNote(0, 0.5, 0.8, "A", 0, 33)], "tab.mid")  # doctest: +SKIP
+    PosixPath('tab.mid')
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    notes_to_midi(notes, program=program, velocity=velocity).write(str(path))
+    logger.info("Tablatura MIDI guardada en %s (%d notas, programa GM %d)", path, len(notes), program)
+    return path
+
+
+# ---------------------------------------------------------------------------
+# Síntesis y mezcla para escuchar la tablatura
+# ---------------------------------------------------------------------------
+
+
+def resolve_synth_method(method: str = "auto") -> str:
+    """Traduce el método de síntesis pedido al que se usará en esta máquina.
+
+    Parameters
+    ----------
+    method : str, optional
+        ``"auto"`` (fluidsynth si hay ejecutable y soundfont GM, si no
+        Karplus-Strong), ``"fluidsynth"`` o ``"karplus-strong"``.
+
+    Returns
+    -------
+    str
+        ``"fluidsynth"`` o ``"karplus-strong"``.
+
+    Raises
+    ------
+    ValueError
+        Si el método no está en :data:`SYNTH_METHODS`.
+    RuntimeError
+        Si se pide ``"fluidsynth"`` y no está disponible.
+
+    Examples
+    --------
+    >>> resolve_synth_method("karplus-strong")
+    'karplus-strong'
+    """
+    return _resolve_method(method)
+
+
+def _as_gt_notes(notes: Sequence[TabNote]) -> list[GTNote]:
+    """Adapta las notas de la tablatura al tipo que usan los sintetizadores del dataset.
+
+    Karplus-Strong (:func:`src.synth_dataset.render_karplus_strong`) solo
+    necesita pitch y tiempos; :class:`GTNote` los guarda con otros nombres
+    (``onset_s``/``offset_s``). Se fuerza una duración mínima para que ninguna
+    nota quede sin sonar.
+    """
+    return [
+        GTNote(onset_s=max(0.0, float(n.start_s)),
+               offset_s=max(float(n.end_s), max(0.0, float(n.start_s)) + MIN_MIDI_NOTE_S),
+               midi=int(n.midi), string=n.string, fret=int(n.fret))
+        for n in notes
+    ]
+
+
+def _render_fluidsynth_notes(notes: Sequence[TabNote], sr: int, n_samples: int) -> np.ndarray:
+    """MIDI temporal → fluidsynth → WAV temporal → mono recortado a ``n_samples`` muestras."""
+    with tempfile.TemporaryDirectory(prefix="smartuner_tab_") as tmp:
+        midi_path = Path(tmp) / "tablatura.mid"
+        notes_to_midi(notes).write(str(midi_path))
+        wav_path = render_fluidsynth(midi_path, Path(tmp) / "tablatura.wav", sr=sr)
+        y = _load_wav_mono(wav_path, sr)
+    # fluidsynth deja varios segundos de cola (release + silencio): se ajusta a la
+    # duración esperada con un fundido de salida y se normaliza el pico.
+    return _finish_audio(y, n_samples, sr)
+
+
+def render_notes(
+    notes: Sequence[TabNote],
+    sr: int = 22050,
+    method: str = "auto",
+    seed: int = 0,
+    tail_s: float = TAIL_S,
+) -> np.ndarray:
+    """Sintetiza la tablatura como audio de bajo, con los tiempos absolutos del original.
+
+    La muestra ``k`` del resultado corresponde al instante ``k / sr`` segundos
+    del audio original: la primera nota NO se desplaza al inicio, así que la
+    síntesis y el original se pueden sumar o poner uno en cada canal sin
+    alinearlos (ver :func:`playback_mix`).
+
+    Métodos
+    -------
+    * ``"fluidsynth"``: el MIDI de :func:`notes_to_midi` se renderiza con un
+      soundfont General MIDI (programa 33, bajo eléctrico con dedos). Suena
+      como un bajo de verdad (muestras grabadas).
+    * ``"karplus-strong"``: cada nota es una cuerda pulsada simulada con una
+      línea de retardo realimentada (ver
+      :func:`src.synth_dataset.render_karplus_strong`). No necesita nada
+      instalado y es rápido (~1 s para 1000 notas / 6 min de audio).
+    * ``"auto"``: fluidsynth si está disponible; si no (o si falla),
+      Karplus-Strong.
+
+    Parameters
+    ----------
+    notes : Sequence[TabNote]
+        Notas de la tablatura (tiempos en s).
+    sr : int, optional
+        Frecuencia de muestreo (Hz); usa la del audio original para poder mezclarlos.
+    method : str, optional
+        ``"auto"``, ``"fluidsynth"`` o ``"karplus-strong"``.
+    seed : int, optional
+        Semilla del ruido de excitación de Karplus-Strong (resultado reproducible).
+    tail_s : float, optional
+        Cola después del final de la última nota (s), para que su release no se corte.
+
+    Returns
+    -------
+    np.ndarray
+        Señal mono ``float32`` de ``round((fin de la última nota + tail_s)·sr)``
+        muestras con pico :data:`PLAYBACK_PEAK` (``round(tail_s·sr)`` ceros si
+        no hay notas).
+
+    Raises
+    ------
+    ValueError
+        Método desconocido o ``sr`` no positiva.
+    RuntimeError
+        Si se pide ``"fluidsynth"`` y no está disponible o falla.
+
+    Examples
+    --------
+    >>> y = render_notes([TabNote(0, 0.5, 0.8, "A", 0, 33)], sr=8000, method="karplus-strong")
+    >>> y.shape, y.dtype, bool(abs(y[:4000]).max() == 0.0)
+    ((10400,), dtype('float32'), True)
+    """
+    if int(sr) <= 0:
+        raise ValueError(f"La frecuencia de muestreo debe ser positiva (recibido {sr}).")
+    sr = int(sr)
+    used = _resolve_method(method)
+    end_s = max((max(float(n.end_s), float(n.start_s) + MIN_MIDI_NOTE_S) for n in notes), default=0.0)
+    n_samples = int(round((end_s + tail_s) * sr))
+    if not notes:
+        return np.zeros(n_samples, dtype=np.float32)
+
+    t0 = time.perf_counter()
+    y: np.ndarray | None = None
+    if used == "fluidsynth":
+        try:
+            y = _render_fluidsynth_notes(notes, sr, n_samples)
+        except RuntimeError as exc:
+            if method != "auto":
+                raise
+            # En modo automático un fallo de fluidsynth no impide escuchar: se usa el respaldo.
+            logger.warning("fluidsynth falló (%s); se sintetiza con Karplus-Strong.", exc)
+            used = "karplus-strong"
+    if y is None:
+        y = render_karplus_strong(_as_gt_notes(notes), sr=sr, seed=seed, tail_s=tail_s)
+        y = _pad_to(np.asarray(y, dtype=np.float32), n_samples)  # misma longitud que con fluidsynth
+    logger.info("Tablatura sintetizada con %s: %d notas, %.1f s de audio en %.2f s",
+                used, len(notes), y.size / sr, time.perf_counter() - t0)
+    return y.astype(np.float32, copy=False)
+
+
+def _as_mono(y: np.ndarray) -> np.ndarray:
+    """Señal mono ``float32``: promedia los canales si viene con forma ``(n, canales)``."""
+    y = np.asarray(y, dtype=np.float32)
+    if y.ndim == 2:
+        y = y.mean(axis=1, dtype=np.float32)
+    elif y.ndim != 1:
+        raise ValueError(f"Se esperaba una señal 1-D o (n, canales); recibida con forma {y.shape}.")
+    return y
+
+
+def _pad_to(y: np.ndarray, n: int) -> np.ndarray:
+    """Rellena con ceros al final hasta ``n`` muestras (los tiempos absolutos no cambian)."""
+    if y.size >= n:
+        return y[:n]
+    return np.concatenate([y, np.zeros(n - y.size, dtype=y.dtype)])
+
+
+def _rms(y: np.ndarray) -> float:
+    """Valor eficaz (RMS) de la señal, en escala lineal (1 = escala completa)."""
+    # La suma se acumula en float64 para no perder precisión con millones de muestras.
+    return float(np.sqrt(np.mean(np.square(y), dtype=np.float64))) if y.size else 0.0
+
+
+def _peak(y: np.ndarray) -> float:
+    """Pico absoluto max|y| sin crear el array ``|y|`` (importa con 6 min de audio)."""
+    return float(max(np.max(y), -np.min(y))) if y.size else 0.0
+
+
+def _normalize_peak(y: np.ndarray, peak: float = PLAYBACK_PEAK) -> np.ndarray:
+    """Escala EN SITIO la señal float32 (mono o estéreo) para que su pico sea ``peak`` (silencio: sin cambios)."""
+    current = _peak(y)
+    if current > 0.0:
+        y *= np.float32(peak / current)
+    return y
+
+
+def playback_mix(
+    original: np.ndarray | None,
+    synth: np.ndarray,
+    mode: str,
+    synth_gain_db: float = 0.0,
+) -> np.ndarray:
+    """Combina el audio original y la síntesis de la tablatura para escucharlos.
+
+    Ambas señales deben tener la misma frecuencia de muestreo y empezar en el
+    mismo instante (como devuelve :func:`render_notes`). Si hay original, las
+    dos se rellenan con ceros hasta la más larga, de modo que TODOS los modos
+    duran lo mismo y un instante ``t`` es la muestra ``t·sr`` en cualquiera
+    de ellos (la GUI puede cambiar de modo sin perder la posición).
+
+    Modos
+    -----
+    * ``"midi"``: solo la síntesis.
+    * ``"original"``: solo el original.
+    * ``"mezcla"``: ambos sumados. Antes se **iguala la sonoridad**: cada
+      señal se divide por su RMS (valor eficaz, √(media de x²)), de modo que
+      el original y la síntesis pesen lo mismo aunque uno esté grabado más
+      bajo. Si una nota transcrita es incorrecta, las dos frecuencias
+      cercanas producen un batido (|f₁ − f₂| pulsos por segundo) muy audible.
+    * ``"estereo"``: original en el canal izquierdo y síntesis en el derecho
+      (salida ``(n, 2)``), también con la sonoridad igualada. Con auriculares
+      se comparan A/B sin que una señal tape a la otra.
+
+    Al final la salida se normaliza a un pico de :data:`PLAYBACK_PEAK`
+    (en estéreo, el mismo factor para los dos canales, para no romper el
+    equilibrio). Todos los modos quedan así a un nivel parecido y se puede
+    cambiar de uno a otro sin saltos de volumen bruscos.
+
+    Parameters
+    ----------
+    original : np.ndarray | None
+        Audio original (mono ``(n,)`` o ``(n, canales)``, que se promedia a
+        mono). Puede ser None solo en el modo ``"midi"``.
+    synth : np.ndarray
+        Síntesis de la tablatura (:func:`render_notes`).
+    mode : str
+        Uno de :data:`PLAYBACK_MODES`.
+    synth_gain_db : float, optional
+        Nivel de la síntesis respecto al original en ``"mezcla"`` y
+        ``"estereo"`` (dB; 0 = misma sonoridad, −6 = la síntesis a la mitad).
+
+    Returns
+    -------
+    np.ndarray
+        ``float32``; forma ``(n,)`` o ``(n, 2)`` en ``"estereo"``, con
+        ``n = max(len(original), len(synth))`` (``len(synth)`` sin original).
+
+    Raises
+    ------
+    ValueError
+        Modo desconocido, o modo que necesita el original sin él.
+
+    Examples
+    --------
+    >>> orig, synth = np.ones(4, dtype=np.float32), np.full(6, 0.5, dtype=np.float32)
+    >>> playback_mix(orig, synth, "estereo").shape   # original rellenado con ceros hasta 6 muestras
+    (6, 2)
+    >>> mix = playback_mix(orig, synth, "mezcla")
+    >>> mix.shape, round(float(np.abs(mix).max()), 3)
+    ((6,), 0.9)
+    >>> playback_mix(None, synth, "midi").shape
+    (6,)
+    """
+    if mode not in PLAYBACK_MODES:
+        raise ValueError(f"Modo de reproducción desconocido: «{mode}». Opciones: {', '.join(PLAYBACK_MODES)}.")
+    synth = _as_mono(synth)
+    if original is None:
+        if mode != "midi":
+            raise ValueError(f"El modo «{mode}» necesita el audio original y no se recibió.")
+        return _normalize_peak(synth.copy())
+    original = _as_mono(original)
+    n = max(original.size, synth.size)
+    original, synth = _pad_to(original, n), _pad_to(synth, n)
+    if mode == "midi":
+        return _normalize_peak(synth.copy())
+    if mode == "original":
+        return _normalize_peak(original.copy())
+
+    # Igualación de sonoridad: x · g con g = 1/RMS(x) deja las dos señales con RMS = 1
+    # (la síntesis, además, con la ganancia relativa 10^(dB/20)).
+    rms_o, rms_s = _rms(original), _rms(synth)
+    g_o = 1.0 / rms_o if rms_o > 0 else 1.0
+    g_s = 10.0 ** (synth_gain_db / 20.0) / rms_s if rms_s > 0 else 1.0
+    logger.debug("Mezcla «%s»: %d muestras, RMS original %.4f, RMS síntesis %.4f", mode, n, rms_o, rms_s)
+    if mode == "mezcla":
+        mixed = original * np.float32(g_o)
+        mixed += synth * np.float32(g_s)
+        return _normalize_peak(mixed)
+    # Estéreo: el pico conjunto es el mayor de los dos canales, así que se calcula
+    # un único factor k y se escribe cada canal directamente en su columna (sin
+    # copias intermedias: con 6 min de audio, np.stack + normalizar tardaba ~1 s).
+    joint_peak = max(g_o * _peak(original), g_s * _peak(synth))
+    k = PLAYBACK_PEAK / joint_peak if joint_peak > 0 else 1.0
+    out = np.empty((n, 2), dtype=np.float32)
+    np.multiply(original, np.float32(g_o * k), out=out[:, 0])
+    np.multiply(synth, np.float32(g_s * k), out=out[:, 1])
+    return out
