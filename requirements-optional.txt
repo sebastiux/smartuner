@@ -1,9 +1,7 @@
 # Dependencias opcionales.
 #   pip install -r requirements-optional.txt
 #
-# Reproducción de audio desde la GUI (requiere PortAudio en el sistema; las ruedas de
-# Windows y macOS ya lo incluyen):
-sounddevice>=0.4.6
+# (sounddevice, para reproducir audio, está en requirements.txt.)
 #
 # Separación del bajo con Demucs ("Separar bajo de mezcla", método «demucs» o «auto»).
 # En Windows basta con (en la misma terminal/venv con que ejecutas Smartuner):
