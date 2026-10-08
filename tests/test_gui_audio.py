@@ -227,7 +227,9 @@ def test_estado_vacio_muestra_mensaje_guia() -> None:
         assert tab.btn_dataset.instate(["!disabled"])
         assert tab.btn_reanalyze.instate(["disabled"])
         assert tab.btn_play_segment.instate(["disabled"])
-        assert tab.chk_separate.instate(["!disabled"] if demucs_available() else ["disabled"])
+        # La separación siempre está disponible: sin Demucs se usa HPSS.
+        assert tab.chk_separate.instate(["!disabled"])
+        assert "HPSS" in tab._separate_help() or demucs_available()
         if not demucs_available():
             assert "pip install" in tab._separate_help()
         if not tab.player.available:

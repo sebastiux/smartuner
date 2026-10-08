@@ -55,7 +55,7 @@ from gui.widgets import AudioPlayer, PlotFrame, Tooltip, show_error
 from src import plots
 from src.experiments import match_segments_to_gt
 from src.pitch import midi_to_name
-from src.separation import demucs_available
+from src.separation import demucs_available, resolve_method
 
 if TYPE_CHECKING:  # solo para las anotaciones de tipo (evita importes circulares)
     from gui.app import SmartunerApp
@@ -293,7 +293,7 @@ class AudioTab(ttk.Frame):
     player : AudioPlayer
         Reproductor (puede no estar disponible; ver ``player.error``).
     separate_var : tk.BooleanVar
-        Estado de la casilla «Separar bajo de mezcla (Demucs)».
+        Estado de la casilla «Separar bajo de mezcla» (Demucs o HPSS según la configuración).
     info_values : dict[str, ttk.Label]
         Etiquetas con los valores del panel de información (claves de :data:`INFO_FIELDS`).
     drawn_selection : int | None
@@ -392,7 +392,7 @@ class AudioTab(ttk.Frame):
         ttk.Separator(actions, orient="vertical").pack(side="left", fill="y", padx=6, pady=2)
 
         self.separate_var = tk.BooleanVar(master=self, value=bool(self.app.state.config.audio.separate_bass))
-        self.chk_separate = ttk.Checkbutton(actions, text="Separar bajo de mezcla (Demucs)",
+        self.chk_separate = ttk.Checkbutton(actions, text="Separar bajo de mezcla",
                                             variable=self.separate_var, command=self._on_separate_toggled)
         self.chk_separate.pack(side="left")
         Tooltip(self.chk_separate, self._separate_help)
@@ -648,17 +648,26 @@ class AudioTab(ttk.Frame):
         return base + f"\n\nArchivo: {Path(self.analysis.path).name}"
 
     def _separate_help(self) -> str:
-        """Tooltip de la casilla de Demucs (explica cómo instalarlo si falta)."""
-        base = ("Si el MP3 es una canción completa (mezcla), Demucs (red neuronal de separación de fuentes) "
-                "aísla primero la pista de bajo y se analiza ese «stem». Tarda bastante: el resultado se guarda "
-                "en la caché. Si el audio ya es un bajo solo, déjala desactivada.")
-        if not self.demucs_ok:
-            return ("Demucs no está instalado, así que la separación está deshabilitada.\n"
-                    "Para activarla instala las dependencias opcionales (incluye PyTorch, pesado):\n"
-                    "    pip install demucs\n"
-                    "o  pip install -r requirements-optional.txt\n"
-                    "y reinicia Smartuner.\n\n" + base)
-        return base + "\n\nAl cambiarla pulsa «Analizar de nuevo»."
+        """Tooltip de la casilla de separación: qué método se usará y cómo obtener Demucs."""
+        base = ("Actívala solo si el MP3 es una canción completa (mezcla); si el audio ya es un bajo "
+                "aislado, déjala desactivada.")
+        method = self.app.state.config.audio.separation_method
+        effective = resolve_method(method) if method == "auto" else method
+        demucs_text = ("Demucs (red neuronal de separación de fuentes) aísla la pista de bajo y se analiza ese "
+                       "«stem». Es el método de mayor calidad pero tarda varios minutos por canción en CPU; "
+                       "el resultado se guarda en la caché.")
+        hpss_text = ("HPSS (separación armónico-percusiva) + pasa-bajas: rápido y sin PyTorch. Quita la "
+                     "percusión y los efectos, pero no separa guitarras o teclados graves.")
+        if effective == "demucs":
+            detail = "Método actual: Demucs.\n" + demucs_text
+        else:
+            detail = "Método actual: HPSS.\n" + hpss_text
+            if not self.demucs_ok:
+                detail += ("\n\nPara usar Demucs instala las dependencias opcionales (incluye PyTorch):\n"
+                           "    pip install -r requirements-optional.txt\n"
+                           "y reinicia Smartuner (la primera separación descarga ~80 MB de pesos).")
+        return (base + "\n\n" + detail + "\n\nEl método se elige en Configuración (audio.separation_method). "
+                "Al cambiar la casilla pulsa «Analizar de nuevo».")
 
     def _play_help(self, text: str) -> str:
         """Tooltip de un botón de reproducción (o el motivo por el que está deshabilitado)."""
@@ -788,14 +797,14 @@ class AudioTab(ttk.Frame):
         self.app.generate_dataset()
 
     def _on_separate_toggled(self) -> None:
-        """Casilla de Demucs: escribe ``config.audio.separate_bass`` y avisa con ``config_changed``."""
+        """Casilla de separación: escribe ``config.audio.separate_bass`` y avisa con ``config_changed``."""
         value = bool(self.separate_var.get())
         cfg = self.app.state.config
         if value == bool(cfg.audio.separate_bass):
             return
         cfg.audio.separate_bass = value
-        logger.info("Separación del bajo con Demucs %s (se aplicará al volver a analizar).",
-                    "activada" if value else "desactivada")
+        logger.info("Separación del bajo %s (método: %s; se aplicará al volver a analizar).",
+                    "activada" if value else "desactivada", cfg.audio.separation_method)
         self.app.state.events.emit("config_changed", key="audio.separate_bass")
 
     def _on_play_all(self) -> None:
@@ -1151,7 +1160,7 @@ class AudioTab(ttk.Frame):
         enable(self.btn_open, not busy)
         enable(self.btn_dataset, not busy)
         enable(self.btn_reanalyze, has_audio and not busy)
-        enable(self.chk_separate, self.demucs_ok and not busy)
+        enable(self.chk_separate, not busy)
         playable = self.player.available
         enable(self.btn_play_all, playable and has_audio)
         enable(self.btn_play_segment, playable and has_segment)
@@ -1319,7 +1328,7 @@ class AudioTab(ttk.Frame):
             steps = ("1 · Carga", "2 · Separación\n(opcional)", "3 · Preproceso\n(pasa-bajas)",
                      "4 · Onsets y\nsegmentos", "5 · Pitch\n(pYIN)", "6 · Espectro\ny bandits")
         else:
-            steps = ("1 · Carga\n(ffmpeg)", "2 · Separación\n(Demucs, opcional)",
+            steps = ("1 · Carga\n(ffmpeg)", "2 · Separación\n(opcional)",
                      "3 · Preprocesado\n(pasa-bajas 400 Hz)", "4 · Onsets y\nsegmentos", "5 · Pitch\n(pYIN)",
                      "6 · Espectro y\nbandits")
 
