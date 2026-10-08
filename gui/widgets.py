@@ -12,14 +12,15 @@ lógica de presentación:
   su barra de herramientas (zoom, desplazamiento, guardar).
 * :class:`ScrollableFrame` — marco con barra de desplazamiento vertical.
 * :class:`StatusBar` — mensaje + barra de progreso + botón Cancelar.
-* :class:`AudioPlayer` — reproducción opcional con ``sounddevice``.
+* :class:`AudioPlayer` — reproducción del audio original con ``sounddevice``.
+* :class:`HoverTooltip`, :func:`tree_heading_at` — ayudas según lo que hay bajo el puntero.
 """
 
 from __future__ import annotations
 
 import logging
 import tkinter as tk
-from collections.abc import Callable
+from collections.abc import Callable, Hashable
 from tkinter import messagebox, ttk
 from typing import Any
 
@@ -35,6 +36,7 @@ logger = logging.getLogger(__name__)
 UI_SURFACE = "#fcfcfb"
 UI_TEXT = "#0b0b0b"
 UI_TEXT_SECONDARY = "#52514e"
+UI_TEXT_MUTED = "#898781"
 UI_ACCENT = "#2a78d6"
 UI_ERROR = "#d03b3b"
 
@@ -42,12 +44,17 @@ UI_ERROR = "#d03b3b"
 class Tooltip:
     """Muestra un texto de ayuda cuando el ratón se detiene sobre un widget.
 
+    El recuadro aparece JUNTO AL PUNTERO (abajo a la derecha) y nunca se sale
+    de la pantalla: en widgets altos (una tabla, un lienzo) un tooltip
+    colocado debajo de todo el widget quedaría fuera de la vista.
+
     Parameters
     ----------
     widget : tk.Widget
         Widget al que se asocia la ayuda.
     text : str | Callable[[], str]
-        Texto (o función que lo genera, para ayudas dinámicas).
+        Texto (o función que lo genera, para ayudas dinámicas). Una cadena
+        vacía no muestra nada.
     delay_ms : int, optional
         Espera antes de mostrarse (500 ms).
     wraplength : int, optional
@@ -71,29 +78,182 @@ class Tooltip:
 
     def _cancel(self) -> None:
         if self._after_id is not None:
-            self.widget.after_cancel(self._after_id)
+            try:
+                self.widget.after_cancel(self._after_id)
+            except tk.TclError:  # el widget ya se destruyó
+                pass
             self._after_id = None
 
+    def current_text(self) -> str:
+        """Texto que se mostraría ahora (evalúa ``text`` si es una función)."""
+        return self.text() if callable(self.text) else self.text
+
     def _show(self) -> None:
-        text = self.text() if callable(self.text) else self.text
+        self._after_id = None
+        try:
+            text = self.current_text()
+        except tk.TclError:  # el widget se destruyó mientras se esperaba
+            return
         if not text or self._tip is not None:
             return
-        x = self.widget.winfo_rootx() + 16
-        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
         self._tip = tip = tk.Toplevel(self.widget)
+        tip.withdraw()  # se coloca antes de mostrarse: sin parpadeo en una esquina
         tip.wm_overrideredirect(True)
-        tip.wm_geometry(f"+{x}+{y}")
         label = tk.Label(
             tip, text=text, justify="left", wraplength=self.wraplength, background="#fffbe8",
             foreground=UI_TEXT, relief="solid", borderwidth=1, padx=8, pady=6, font=("TkDefaultFont", 9),
         )
         label.pack()
+        tip.update_idletasks()
+        x, y = self._position(tip.winfo_reqwidth(), tip.winfo_reqheight())
+        tip.wm_geometry(f"+{x}+{y}")
+        tip.deiconify()
+
+    def _position(self, width: int, height: int) -> tuple[int, int]:
+        """Esquina superior izquierda (px de pantalla) del recuadro de ``width`` × ``height`` px.
+
+        Abajo a la derecha del puntero; si no cabe debajo, encima; nunca fuera
+        de la pantalla por la derecha. Si el puntero no está en esta pantalla,
+        se usa la esquina inferior izquierda del widget.
+        """
+        w = self.widget
+        px, py = w.winfo_pointerx(), w.winfo_pointery()
+        if px < 0 or py < 0:
+            px, py = w.winfo_rootx() + 2, w.winfo_rooty() + w.winfo_height() - 14
+        screen_w, screen_h = w.winfo_screenwidth(), w.winfo_screenheight()
+        x, y = px + 14, py + 18
+        if y + height > screen_h:
+            y = max(0, py - height - 10)
+        x = max(0, min(x, screen_w - width - 4))
+        return x, y
+
+    def hide(self) -> None:
+        """Oculta el tooltip (y cancela uno a punto de aparecer)."""
+        self._hide()
 
     def _hide(self, _event: tk.Event | None = None) -> None:
         self._cancel()
         if self._tip is not None:
-            self._tip.destroy()
+            try:
+                self._tip.destroy()
+            except tk.TclError:
+                pass
             self._tip = None
+
+
+class HoverTooltip(Tooltip):
+    """Tooltip cuyo texto depende de la ZONA bajo el puntero (una nota de un lienzo, un encabezado...).
+
+    Al pasar a otra zona se oculta y se vuelve a esperar ``delay_ms``; fuera
+    de cualquier zona no se muestra nada (no tapa el contenido).
+
+    Parameters
+    ----------
+    widget : tk.Widget
+        Widget al que se asocia.
+    key_for : Callable[[int, int], Hashable | None]
+        ``(x, y)`` (px relativos al widget) → identificador de la zona
+        (None = nada que explicar).
+    text_for : Callable[[Hashable], str]
+        Texto de una zona ("" = no mostrar).
+    delay_ms : int, optional
+        Espera antes de mostrarse (350 ms).
+    wraplength : int, optional
+        Ancho máximo del texto (px).
+
+    Examples
+    --------
+    Ayuda por columna en una tabla::
+
+        HoverTooltip(tree, lambda x, y: tree_heading_at(tree, x, y), help_for_column)
+    """
+
+    def __init__(self, widget: tk.Widget, key_for: Callable[[int, int], Hashable | None],
+                 text_for: Callable[[Hashable], str], delay_ms: int = 350, wraplength: int = 360) -> None:
+        self._key_for = key_for
+        self._text_for = text_for
+        self._hover: Hashable | None = None
+        super().__init__(widget, self._text_under_pointer, delay_ms=delay_ms, wraplength=wraplength)
+        widget.bind("<Motion>", self._on_motion, add="+")
+
+    def hide(self) -> None:
+        """Oculta el tooltip (p. ej. al redibujar el lienzo: lo que hay bajo el puntero cambió)."""
+        self._hover = None
+        self._hide()
+
+    def pointer_key(self) -> Hashable | None:
+        """Zona bajo el puntero (o None)."""
+        w = self.widget
+        try:
+            return self._key_for(w.winfo_pointerx() - w.winfo_rootx(), w.winfo_pointery() - w.winfo_rooty())
+        except tk.TclError:
+            return None
+
+    def _text_under_pointer(self) -> str:
+        """Texto de la zona actual (cadena vacía = no mostrar nada)."""
+        key = self.pointer_key()
+        return self._text_for(key) if key is not None else ""
+
+    def _on_motion(self, event: tk.Event) -> None:
+        """Reinicia la espera cuando el ratón pasa a otra zona."""
+        key = self._key_for(event.x, event.y)
+        if key != self._hover:
+            self._hover = key
+            self._hide()
+            if key is not None:
+                self._schedule()
+
+
+def tree_display_columns(tree: ttk.Treeview) -> list[str]:
+    """Columnas visibles de ``tree`` en orden (resuelve ``displaycolumns = "#all"``).
+
+    Parameters
+    ----------
+    tree : ttk.Treeview
+        Tabla.
+
+    Returns
+    -------
+    list[str]
+        Identificadores de las columnas de datos visibles (sin ``"#0"``).
+    """
+    shown = tree.cget("displaycolumns")
+    if isinstance(shown, str):
+        shown = tree.tk.splitlist(shown)
+    shown = [str(c) for c in shown]
+    if not shown or shown == ["#all"]:
+        columns = tree.cget("columns")
+        return [str(c) for c in (tree.tk.splitlist(columns) if isinstance(columns, str) else columns)]
+    return shown
+
+
+def tree_heading_at(tree: ttk.Treeview, x: int, y: int) -> str | None:
+    """Columna cuyo ENCABEZADO está en ``(x, y)`` (px relativos a la tabla), o None.
+
+    Parameters
+    ----------
+    tree : ttk.Treeview
+        Tabla.
+    x, y : int
+        Coordenadas dentro de la tabla (px).
+
+    Returns
+    -------
+    str | None
+        ``"#0"`` para la columna del árbol, el identificador de la columna en
+        las demás, o None fuera de los encabezados.
+    """
+    if tree.identify_region(x, y) not in ("heading", "separator"):
+        return None
+    column = tree.identify_column(x)  # "#n": n-ésima columna VISIBLE (#0 = la del árbol)
+    if column == "#0":
+        return "#0"
+    try:
+        index = int(column.lstrip("#")) - 1
+    except ValueError:
+        return None
+    shown = tree_display_columns(tree)
+    return shown[index] if 0 <= index < len(shown) else None
 
 
 class ParamField(ttk.Frame):
@@ -113,36 +273,54 @@ class ParamField(ttk.Frame):
         Valor inicial.
     on_change : Callable[[str, Any], None] | None
         Se llama con ``(key, valor)`` cuando el usuario cambia un valor VÁLIDO.
+    label_width : int, optional
+        Ancho de la etiqueta en caracteres (26); una sección puede medir sus
+        etiquetas y alinear todos sus campos.
+    unit_width : int, optional
+        Ancho de la unidad en caracteres (4; «muestras» necesita 8).
 
     Notes
     -----
     Tipos soportados: ``int``, ``float`` (Spinbox), ``bool`` (Checkbutton),
     ``choice`` (Combobox), ``int_or_none`` (Spinbox; vacío = None) y
     ``float_list`` (Entry con valores separados por comas).
+
+    Los ``Spinbox`` y ``Combobox`` de ttk cambian su valor con la rueda del
+    ratón: dentro de un formulario desplazable eso modificaría parámetros sin
+    querer al desplazar la página. Aquí la rueda sobre el control desplaza el
+    :class:`ScrollableFrame` que lo contiene (si lo hay) y nunca cambia el valor.
     """
 
-    def __init__(self, master: tk.Misc, key: str, spec: ParamSpec, value: Any, on_change: Callable[[str, Any], None] | None = None) -> None:
+    def __init__(self, master: tk.Misc, key: str, spec: ParamSpec, value: Any,
+                 on_change: Callable[[str, Any], None] | None = None, label_width: int = 26,
+                 unit_width: int = 4) -> None:
         super().__init__(master)
         self.key = key
         self.spec = spec
         self.on_change = on_change
         self.var: tk.Variable
-        self.label = ttk.Label(self, text=spec.label, width=26, anchor="w")
+        self.label = ttk.Label(self, text=spec.label, width=label_width, anchor="w")
         self.label.grid(row=0, column=0, sticky="w", padx=(0, 6))
+        # master=self: las variables pertenecen al intérprete de ESTA ventana (con varias tk.Tk,
+        # p. ej. en las pruebas, una variable sin master se crearía en la primera).
         if spec.kind == "bool":
-            self.var = tk.BooleanVar(value=bool(value))
+            self.var = tk.BooleanVar(master=self, value=bool(value))
             self.control: tk.Widget = ttk.Checkbutton(self, variable=self.var, command=self._changed)
         elif spec.kind == "choice":
-            self.var = tk.StringVar(value=str(value))
-            self.control = ttk.Combobox(self, textvariable=self.var, values=list(spec.choices), state="readonly", width=14)
+            # El Combobox muestra las etiquetas en español (ParamSpec.choice_labels); parse()
+            # las traduce de vuelta al identificador que guarda la configuración.
+            labels = [spec.choice_label(c) for c in spec.choices]
+            self.var = tk.StringVar(master=self, value=spec.choice_label(str(value)))
+            self.control = ttk.Combobox(self, textvariable=self.var, values=labels, state="readonly",
+                                        width=max(14, max((len(t) for t in labels), default=0) + 2))
             self.control.bind("<<ComboboxSelected>>", lambda _e: self._changed())
         elif spec.kind == "float_list":
-            self.var = tk.StringVar(value=", ".join(f"{v:g}" for v in (value or [])))
+            self.var = tk.StringVar(master=self, value=", ".join(f"{v:g}" for v in (value or [])))
             self.control = ttk.Entry(self, textvariable=self.var, width=30)
             self.control.bind("<FocusOut>", lambda _e: self._changed())
             self.control.bind("<Return>", lambda _e: self._changed())
         else:
-            self.var = tk.StringVar(value="" if value is None else f"{value:g}" if isinstance(value, float) else str(value))
+            self.var = tk.StringVar(master=self, value="" if value is None else f"{value:g}" if isinstance(value, float) else str(value))
             self.control = ttk.Spinbox(
                 self, textvariable=self.var, width=12,
                 from_=spec.minimum if spec.minimum is not None else -1e9,
@@ -151,15 +329,46 @@ class ParamField(ttk.Frame):
             )
             self.control.bind("<FocusOut>", lambda _e: self._changed())
             self.control.bind("<Return>", lambda _e: self._changed())
+        if spec.kind in ("choice", "int", "float", "int_or_none"):
+            for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                self.control.bind(sequence, self._on_wheel)
         self.control.grid(row=0, column=1, sticky="w")
-        self.unit = ttk.Label(self, text=spec.unit, foreground=UI_TEXT_SECONDARY, width=4)
+        self.unit = ttk.Label(self, text=spec.unit, foreground=UI_TEXT_SECONDARY, width=unit_width)
         self.unit.grid(row=0, column=2, sticky="w", padx=(4, 0))
         self.error = ttk.Label(self, text="", foreground=UI_ERROR)
         self.error.grid(row=1, column=0, columnspan=3, sticky="w")
         self.error.grid_remove()
+        self._enabled = True
         help_text = spec.help + (f"\nRango: {spec.minimum:g} – {spec.maximum:g}" if spec.minimum is not None and spec.maximum is not None else "")
         Tooltip(self.label, help_text)
         Tooltip(self.control, help_text)
+
+    def _on_wheel(self, event: tk.Event) -> str:
+        """Rueda sobre el control: desplaza el formulario que lo contiene y NO cambia el valor."""
+        widget: Any = self.master
+        while widget is not None:
+            if isinstance(widget, ScrollableFrame):
+                widget.scroll_wheel(event)
+                break
+            widget = getattr(widget, "master", None)
+        return "break"
+
+    @property
+    def enabled(self) -> bool:
+        """True si el control admite cambios (ver :meth:`set_enabled`)."""
+        return self._enabled
+
+    def set_enabled(self, enabled: bool) -> None:
+        """Habilita o deshabilita el control (la etiqueta se atenúa cuando no se usa).
+
+        Parameters
+        ----------
+        enabled : bool
+            False, p. ej., para ``env.n_fft`` cuando el espectro es CQT.
+        """
+        self._enabled = bool(enabled)
+        self.control.state(["!disabled"] if enabled else ["disabled"])
+        self.label.configure(foreground=UI_TEXT if enabled else UI_TEXT_MUTED)
 
     def parse(self) -> Any:
         """Convierte el texto del control al tipo del parámetro.
@@ -179,9 +388,10 @@ class ParamField(ttk.Frame):
         if spec.kind == "bool":
             return bool(raw)
         if spec.kind == "choice":
-            if raw not in spec.choices:
+            value = spec.choice_value(str(raw))  # acepta la etiqueta mostrada o el identificador
+            if value is None:
                 raise ValueError(f"Opción inválida: {raw}")
-            return raw
+            return value
         if spec.kind == "float_list":
             parts = [p.strip() for p in str(raw).replace(";", ",").split(",") if p.strip()]
             if not parts:
@@ -209,13 +419,25 @@ class ParamField(ttk.Frame):
             self.var.set(bool(value))
         elif self.spec.kind == "float_list":
             self.var.set(", ".join(f"{v:g}" for v in (value or [])))
+        elif self.spec.kind == "choice":
+            self.var.set(self.spec.choice_label(str(value)))
         elif value is None:
             self.var.set("")
         else:
             self.var.set(f"{value:g}" if isinstance(value, float) else str(value))
-        self._show_error(None)
+        self.show_error(None)
 
-    def _show_error(self, message: str | None) -> None:
+    def show_error(self, message: str | None) -> None:
+        """Muestra ``message`` en rojo bajo el control (None u "" lo oculta).
+
+        Sirve también para errores que detecta otra capa (p. ej.
+        :meth:`src.config.Config.validate` sobre una lista de barrido).
+
+        Parameters
+        ----------
+        message : str | None
+            Texto del error.
+        """
         if message:
             self.error.configure(text="⚠ " + message)
             self.error.grid()
@@ -226,9 +448,9 @@ class ParamField(ttk.Frame):
         try:
             value = self.parse()
         except ValueError as exc:
-            self._show_error(str(exc))
+            self.show_error(str(exc))
             return
-        self._show_error(None)
+        self.show_error(None)
         if self.on_change:
             self.on_change(self.key, value)
 
@@ -287,7 +509,11 @@ class PlotFrame(ttk.Frame):
 
 
 class ScrollableFrame(ttk.Frame):
-    """Marco con desplazamiento vertical; el contenido va en ``self.inner``."""
+    """Marco con desplazamiento vertical; el contenido va en ``self.inner``.
+
+    La rueda del ratón desplaza el marco cuando el puntero está sobre él (en
+    Windows/macOS llega ``<MouseWheel>``; en Linux/X11, ``<Button-4/5>``).
+    """
 
     def __init__(self, master: tk.Misc, **kwargs: Any) -> None:
         super().__init__(master, **kwargs)
@@ -304,29 +530,51 @@ class ScrollableFrame(ttk.Frame):
             self.inner.bind_all(seq, self._on_wheel, add="+")
 
     def _on_wheel(self, event: tk.Event) -> None:
-        widget = self.winfo_containing(event.x_root, event.y_root)
+        """Rueda en cualquier parte de la ventana: solo actúa si el puntero está sobre este marco."""
+        try:
+            widget = self.winfo_containing(event.x_root, event.y_root)
+        except (tk.TclError, KeyError):  # puntero sobre un menú o una ventana ya destruida
+            return
         if widget is None or not str(widget).startswith(str(self)):
             return
+        self.scroll_wheel(event)
+
+    def scroll_wheel(self, event: tk.Event) -> None:
+        """Desplaza tres líneas arriba o abajo según el evento de rueda (``delta`` o botón 4/5).
+
+        Parameters
+        ----------
+        event : tk.Event
+            ``<MouseWheel>`` (``delta`` > 0 = hacia arriba) o ``<Button-4>``/``<Button-5>``.
+        """
         if getattr(event, "num", None) == 4:
             delta = -1
         elif getattr(event, "num", None) == 5:
             delta = 1
         else:
-            delta = -1 if event.delta > 0 else 1
+            delta = -1 if getattr(event, "delta", 0) > 0 else 1
         self.canvas.yview_scroll(delta, "units")
 
 
 class StatusBar(ttk.Frame):
-    """Barra inferior: mensaje, barra de progreso y botón Cancelar."""
+    """Barra inferior: mensaje, barra de progreso y botón Cancelar.
+
+    La barra de progreso y «Cancelar» se colocan primero (a la derecha) y el
+    mensaje ocupa el resto: un mensaje largo (p. ej. una ruta de exportación)
+    se recorta en lugar de empujar fuera de la ventana el botón Cancelar; el
+    texto completo se ve en el tooltip del mensaje.
+    """
 
     def __init__(self, master: tk.Misc, on_cancel: Callable[[], None] | None = None) -> None:
         super().__init__(master, padding=(8, 2))
-        self.message = ttk.Label(self, text="Listo.", anchor="w")
-        self.message.pack(side="left", fill="x", expand=True)
         self.cancel_button = ttk.Button(self, text="Cancelar", command=on_cancel or (lambda: None), state="disabled")
         self.cancel_button.pack(side="right", padx=(6, 0))
         self.progress = ttk.Progressbar(self, length=220, mode="determinate", maximum=1.0)
         self.progress.pack(side="right")
+        # width=1: el tamaño PEDIDO no depende del texto (si no, un texto largo agrandaría la barra).
+        self.message = ttk.Label(self, text="Listo.", anchor="w", width=1)
+        self.message.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        Tooltip(self.message, lambda: str(self.message.cget("text")), delay_ms=700, wraplength=600)
 
     def set_message(self, text: str) -> None:
         """Muestra ``text`` en la barra de estado."""
@@ -346,46 +594,119 @@ class StatusBar(ttk.Frame):
 
 
 class AudioPlayer:
-    """Reproducción opcional de audio con ``sounddevice``.
+    """Reproducción del audio original con ``sounddevice`` (pestaña Audio).
 
-    Si ``sounddevice`` (o PortAudio) no está disponible, ``available`` es False y
-    la GUI deshabilita los botones de reproducción con un tooltip explicativo.
+    ``sounddevice`` es una dependencia principal (``requirements.txt``), pero
+    puede faltar PortAudio o una salida de audio (p. ej. un servidor sin
+    tarjeta de sonido). La detección es la misma que la del reproductor de la
+    tablatura (:func:`gui.playback.load_sounddevice`): exige una salida por
+    defecto, no solo que el módulo se importe. Si no se puede reproducir,
+    ``available`` es False y la GUI deshabilita los botones con ``error`` en
+    su tooltip.
+
+    Parameters
+    ----------
+    module : Any | None, optional
+        Módulo ``sounddevice`` (o un sustituto con ``play``/``stop``, p. ej. en
+        las pruebas). Si es None se detecta.
+
+    Notes
+    -----
+    sounddevice tiene UNA reproducción «actual» por proceso: ``sd.play``
+    detiene la anterior. La aplicación coordina los dos reproductores (este y
+    el de la pestaña Tablatura) con :meth:`gui.app.SmartunerApp.claim_audio_output`
+    para que nunca haya dos activos ni un estado incoherente.
     """
 
-    def __init__(self) -> None:
-        self._sd: Any = None
-        self.error: str = ""
-        try:
-            import sounddevice as sd  # type: ignore[import-not-found]
+    def __init__(self, module: Any | None = None) -> None:
+        from gui.playback import SoundDeviceOutput  # importe diferido: playback depende de src.tab
 
-            sd.query_devices()
-            self._sd = sd
-        except Exception as exc:  # noqa: BLE001 - dependencia opcional
-            self.error = (
-                "Reproducción no disponible: instala la dependencia opcional 'sounddevice' "
-                f"(pip install sounddevice) y PortAudio. Detalle: {exc}"
-            )
+        self._output = SoundDeviceOutput(module)
 
     @property
     def available(self) -> bool:
         """True si se puede reproducir audio."""
-        return self._sd is not None
+        return self._output.available
+
+    @property
+    def error(self) -> str:
+        """Motivo por el que no se puede reproducir ("" si se puede)."""
+        return self._output.error
 
     def play(self, y: np.ndarray, sr: int) -> None:
-        """Reproduce ``y`` (no bloqueante); detiene cualquier reproducción previa."""
-        if self._sd is None:
-            raise RuntimeError(self.error)
-        self._sd.stop()
-        self._sd.play(np.asarray(y, dtype=np.float32), int(sr))
+        """Reproduce ``y`` (no bloqueante); detiene cualquier reproducción previa.
+
+        Si la tarjeta no acepta ``sr`` (p. ej. WASAPI en Windows solo admite
+        44 100/48 000 Hz) se remuestrea y se reintenta
+        (:meth:`gui.playback.SoundDeviceOutput.play`).
+
+        Parameters
+        ----------
+        y : np.ndarray
+            Señal mono en [-1, 1].
+        sr : int
+            Frecuencia de muestreo (Hz).
+
+        Raises
+        ------
+        RuntimeError
+            Si no hay reproducción disponible o el dispositivo rechaza el audio.
+        """
+        self._output.play(y, int(sr))
 
     def stop(self) -> None:
-        """Detiene la reproducción en curso."""
-        if self._sd is not None:
-            self._sd.stop()
+        """Detiene la reproducción en curso (no falla si no había ninguna)."""
+        self._output.stop()
+
+    def is_active(self) -> bool | None:
+        """True si lo último que se reprodujo aquí sigue sonando (None si no se sabe)."""
+        return self._output.is_active()
+
+
+def split_error_message(text: str, max_chars: int = 300) -> tuple[str, str]:
+    r"""Separa un mensaje de error en resumen (lo que se lee primero) y detalle técnico.
+
+    El resumen es el primer párrafo (hasta una línea en blanco) o, si no hay
+    párrafos, la primera línea; si es muy largo se corta y el resto pasa al
+    detalle (p. ej. la salida de ffmpeg).
+
+    Parameters
+    ----------
+    text : str
+        Mensaje completo de la excepción.
+    max_chars : int, optional
+        Longitud máxima del resumen (caracteres).
+
+    Returns
+    -------
+    tuple[str, str]
+        ``(resumen, detalle)``; el detalle puede ser "".
+
+    Examples
+    --------
+    >>> split_error_message("No existe el archivo.\n\nRevisa la ruta.")
+    ('No existe el archivo.', 'Revisa la ruta.')
+    >>> split_error_message("ffmpeg falló: x\nlínea 2\nlínea 3")
+    ('ffmpeg falló: x', 'línea 2\nlínea 3')
+    """
+    text = text.strip()
+    if "\n\n" in text:
+        summary, detail = text.split("\n\n", 1)
+    else:
+        summary, _, detail = text.partition("\n")
+    if len(summary) > max_chars:
+        cut = summary.rfind(" ", 0, max_chars)
+        cut = cut if cut > max_chars // 2 else max_chars
+        summary, detail = summary[:cut].rstrip() + "…", ("…" + summary[cut:].lstrip() + "\n" + detail).strip()
+    return summary.strip(), detail.strip()
 
 
 def show_error(parent: tk.Misc, title: str, exc: BaseException | str, details: str | None = None) -> None:
-    """Diálogo de error con el mensaje de la excepción (los detalles van al log).
+    """Diálogo de error con el mensaje de la excepción (el traceback va al log).
+
+    El primer párrafo del mensaje se muestra destacado y el resto (p. ej. la
+    salida técnica de ffmpeg) debajo, en letra más pequeña
+    (:func:`split_error_message`).
 
     Parameters
     ----------
@@ -400,4 +721,8 @@ def show_error(parent: tk.Misc, title: str, exc: BaseException | str, details: s
     """
     if details:
         logger.error("%s\n%s", title, details)
-    messagebox.showerror(title, str(exc), parent=parent)
+    summary, extra = split_error_message(str(exc) or type(exc).__name__)
+    if extra:
+        messagebox.showerror(title, summary, detail=extra, parent=parent)
+    else:
+        messagebox.showerror(title, summary, parent=parent)

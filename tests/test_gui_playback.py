@@ -55,10 +55,12 @@ class FakeSoundDevice(types.ModuleType):
         self.latency = latency
         self.reject_rates = reject_rates
         self.plays: list[tuple[np.ndarray, int]] = []
+        self.attempts: list[int] = []  # frecuencias de TODAS las llamadas a play (también las rechazadas)
         self.stops = 0
         self.stream: FakeStream | None = None
 
     def play(self, data: Any, samplerate: int, **_kwargs: Any) -> None:
+        self.attempts.append(int(samplerate))
         if int(samplerate) in self.reject_rates:
             raise RuntimeError(f"Invalid sample rate {samplerate}")
         if self.stream is not None:
@@ -196,6 +198,39 @@ def test_output_resamples_when_device_rejects_the_rate() -> None:
     assert output.is_active() is False
 
 
+def test_output_remembers_the_rejected_rate_and_reuses_the_resampled_signal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regresión: tras el primer rechazo no se reintenta la frecuencia rechazada, y la misma señal se remuestrea una vez."""
+    calls: list[int] = []
+    real_resample = playback._resample
+
+    def counting_resample(y: np.ndarray, sr_from: int, sr_to: int) -> np.ndarray:
+        calls.append(len(y))
+        return real_resample(y, sr_from, sr_to)
+
+    monkeypatch.setattr(playback, "_resample", counting_resample)
+    fake = FakeSoundDevice(reject_rates=(SR,))
+    output = SoundDeviceOutput(fake)
+    track = np.zeros(SR, dtype=np.float32)
+    output.play(track, SR)
+    assert output.forced_sr == 44100 and fake.attempts == [SR, 44100] and len(calls) == 1
+    output.play(track, SR)                      # «▶ Todo» otra vez: ni intento fallido ni remuestreo
+    assert fake.attempts == [SR, 44100, 44100] and len(calls) == 1
+    output.play(track[: SR // 2], SR)           # otra señal: se remuestrea, pero directo a 44 100 Hz
+    assert fake.attempts[-1] == 44100 and len(calls) == 2
+    assert fake.plays[-1][0].shape == (22050,)
+
+
+def test_output_clips_out_of_range_samples() -> None:
+    """Las muestras fuera de [-1, 1] se recortan antes de llegar a PortAudio (sin tocar el arreglo del llamador)."""
+    fake = FakeSoundDevice()
+    output = SoundDeviceOutput(fake)
+    loud = np.array([0.5, 1.4, -1.7, 0.2], dtype=np.float32)
+    output.play(loud, SR)
+    data, _ = fake.plays[-1]
+    np.testing.assert_array_equal(data, np.array([0.5, 1.0, -1.0, 0.2], dtype=np.float32))
+    assert loud[1] == pytest.approx(1.4)
+
+
 # ---------------------------------------------------------------------------
 # Transporte y reloj
 # ---------------------------------------------------------------------------
@@ -234,6 +269,24 @@ def test_play_pause_resume_stop() -> None:
     assert rec.states == ["preparing", "playing", "paused", "playing", "stopped"]
     player.resume()  # parado: reanudar no hace nada
     assert player.state == "stopped"
+
+
+def test_only_one_chain_of_position_ticks() -> None:
+    """Regresión: llamar a ``_tick`` fuera de su temporizador no crea una segunda cadena de avisos.
+
+    Con dos cadenas, cada aviso programaba otro y su número crecía sin límite
+    (miles de avisos por segundo con una tablatura de 990 notas: la GUI se congelaba).
+    """
+    player, _fake, clock, widget, _rec = make_player()
+    player.set_source(notes_a(), sr=SR)
+    player.play()
+    assert len(widget.jobs) == 1
+    for _ in range(5):
+        clock.advance(0.01)
+        player._tick()  # p. ej. una prueba o un script que fuerza un aviso
+        assert len(widget.jobs) == 1
+    widget.run_pending()
+    assert len(widget.jobs) == 1
 
 
 def test_position_is_monotonic_and_compensates_output_latency() -> None:
@@ -421,6 +474,56 @@ def test_background_preparation_and_cancelled_start() -> None:
     assert rec.states[:2] == ["preparing", "playing"]
 
 
+def test_rejected_rate_is_handled_in_the_background_after_the_first_play(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regresión: con una tarjeta que rechaza la frecuencia del análisis, reanudar, saltar o cambiar de modo ya no
+    remuestrea en el hilo de la GUI: el audio se prepara UNA vez, en segundo plano, a la frecuencia aceptada."""
+    jobs: list[tuple[str, Callable[..., Any], Callable[[Any], None]]] = []
+
+    def runner(title: str, fn: Callable[..., Any], on_done: Callable[[Any], None]) -> bool:
+        jobs.append((title, fn, on_done))
+        return True
+
+    def run_job() -> None:
+        _title, fn, on_done = jobs.pop(0)
+        on_done(fn(lambda _f, _m="": None, threading.Event()))
+
+    calls: list[str] = []
+    real_resample = playback._resample
+
+    def counting_resample(y: np.ndarray, sr_from: int, sr_to: int) -> np.ndarray:
+        calls.append(threading.current_thread().name)
+        return real_resample(y, sr_from, sr_to)
+
+    monkeypatch.setattr(playback, "_resample", counting_resample)
+    fake = FakeSoundDevice(reject_rates=(SR,))
+    player, fake, clock, _widget, _rec = make_player(fake, run_in_background=runner)
+    original = np.zeros(int(2.0 * SR), dtype=np.float32)
+    player.set_source(notes_a(), original=original, sr=SR)
+    player.play()
+    run_job()                                   # síntesis
+    assert player.is_playing and fake.plays[-1][1] == 44100
+    assert len(calls) == 1                      # el primer rechazo: una vez, inevitable
+    clock.advance(0.5)
+    player.pause()
+    player.resume()                             # el audio aún está a 8000 Hz → se prepara en segundo plano
+    assert player.state == "preparing" and len(calls) == 1
+    assert jobs[0][0].startswith("Adaptando el audio de la tablatura a 44100 Hz")
+    run_job()
+    assert player.is_playing and player.position_s == pytest.approx(0.5)
+    data, rate = fake.plays[-1]
+    assert rate == 44100 and data.shape[0] == pytest.approx(player.duration_s * 44100 - 0.5 * 44100, abs=2)
+    n_calls, n_attempts = len(calls), len(fake.attempts)
+    player.pause()
+    player.resume()                             # reanudar y saltar: solo recortar, sin remuestrear ni rechazos
+    player.play(1.0)
+    assert len(calls) == n_calls and jobs == []
+    assert fake.attempts[n_attempts:] == [44100, 44100]
+    player.mode = "estereo"                     # cambiar de modo: mezcla en segundo plano, remuestreos reutilizados
+    run_job()
+    assert player.is_playing and fake.plays[-1][0].ndim == 2 and fake.plays[-1][1] == 44100
+    assert len(calls) == n_calls
+
+
 def test_synthesis_errors_are_reported(monkeypatch: pytest.MonkeyPatch) -> None:
     """Un fallo de la síntesis no deja el reproductor colgado en «preparing»: se avisa y queda parado."""
     def broken(*_args: Any, **_kwargs: Any) -> np.ndarray:
@@ -468,6 +571,30 @@ def test_fallback_exports_wav_and_midi_and_opens_system_player(tmp_path: Path,
     player._opener = failing_opener
     player.play()
     assert "xdg-open no existe" in rec.messages[-1] and str(tmp_path) in rec.messages[-1]
+
+
+def test_fallback_keeps_only_the_latest_wav_and_survives_a_locked_file(tmp_path: Path,
+                                                                     monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regresión: sin sounddevice, cada ▶ desde otro instante ya no deja un WAV más (se borran los viejos y todos
+    al cerrar), y un WAV bloqueado (soundfile lanza LibsndfileError, un RuntimeError) se escribe con otro nombre."""
+    monkeypatch.setitem(sys.modules, "sounddevice", None)
+    opened: list[Path] = []
+    player = TabPlayback(FakeWidget(), output=SoundDeviceOutput(), opener=opened.append, export_dir=tmp_path,
+                         method="karplus-strong")
+    player.set_source(notes_a(), sr=SR, name="riff")
+    for start in (0.0, 0.5, 1.0):
+        player.play(start)
+    assert len(opened) == 3 and len(set(opened)) == 3
+    assert sorted(p.name for p in tmp_path.glob("*.wav")) == [opened[-1].name]
+
+    # El WAV de «desde 0» está «abierto en otro programa»: aquí, una carpeta con su nombre.
+    blocked = tmp_path / "riff_midi.wav"
+    blocked.mkdir()
+    player.play(0.0)
+    assert opened[-1] != blocked and opened[-1].name.startswith("riff_midi_") and opened[-1].is_file()
+    player.close()
+    assert list(tmp_path.glob("*.wav")) == [blocked]  # la carpeta no es un WAV exportado: se deja
+    assert (tmp_path / "riff.mid").is_file()
 
 
 @pytest.mark.parametrize("platform, expected", [("darwin", ["open"]), ("linux", ["xdg-open"])])

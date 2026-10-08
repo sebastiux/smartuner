@@ -149,6 +149,17 @@ class SeparationError(RuntimeError):
     """
 
 
+class SeparationDepsError(SeparationError):
+    """El proceso de Demucs no pudo importar PyTorch/Demucs (instalación incompleta o rota).
+
+    Se lanza cuando el runner termina con
+    :data:`src.demucs_runner.EXIT_MISSING_DEPS`: p. ej. en Windows, un torch
+    sin el Redistributable de Visual C++ (``WinError 126``). Con el método
+    ``"auto"`` el pipeline recurre entonces a HPSS en lugar de fallar
+    (:func:`src.pipeline.analyze`).
+    """
+
+
 class SeparationCancelledError(SeparationError, CancelledError):
     """El usuario canceló la separación (se mató el subproceso de Demucs).
 
@@ -704,7 +715,8 @@ def separate_bass(
         tail = reader.tail_text() or "(sin salida)"
         if proc.returncode != 0:
             explanation = "\n".join(reader.errors) or "terminó sin explicar el motivo."
-            raise SeparationError(
+            error_class = SeparationDepsError if proc.returncode == _runner.EXIT_MISSING_DEPS else SeparationError
+            raise error_class(
                 f"Demucs falló (código de salida {proc.returncode}): {explanation}\n\n"
                 f"Últimas líneas de su salida:\n{tail}"
             )

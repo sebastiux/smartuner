@@ -181,3 +181,30 @@ def test_separation_method_default_and_choices(tmp_path: Path) -> None:
     cfg.audio.separation_method = 3  # type: ignore[assignment]
     with pytest.raises(ValueError, match="audio.separation_method debe ser un texto"):
         cfg.validate()
+
+
+def test_sweep_tooltips_explain_what_is_swept_and_measured() -> None:
+    """Regresión: las listas de barrido ya no tienen solo «Lista separada por comas.»: dicen qué se barre,
+    con qué algoritmo, qué se mide y el rango; «Corridas por barrido» explica la reducción en pistas largas."""
+    from src.config import PARAM_SPECS
+    from src.experiments import SWEEP_MAX_SEGMENTS
+
+    expected = {"sweep_epsilon": "ε-greedy", "sweep_q0": "optimista", "sweep_c": "UCB1", "sweep_tau": "Softmax",
+                "sweep_lambda": "precisión"}
+    for name, word in expected.items():
+        help_text = PARAM_SPECS[f"experiment.{name}"].help
+        assert word in help_text and "Rango válido" in help_text and len(help_text) > 120, name
+    assert f"más de {SWEEP_MAX_SEGMENTS} notas" in PARAM_SPECS["experiment.sweep_runs"].help
+
+
+def test_choice_labels_round_trip() -> None:
+    """Las etiquetas en español de las opciones se traducen de vuelta a su identificador."""
+    from src.config import PARAM_SPECS
+
+    for spec in PARAM_SPECS.values():
+        if spec.kind != "choice":
+            continue
+        assert {value for value, _label in spec.choice_labels} <= set(spec.choices)
+        for value in spec.choices:
+            assert spec.choice_value(spec.choice_label(value)) == value
+            assert spec.choice_value(value) == value

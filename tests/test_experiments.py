@@ -262,6 +262,23 @@ def test_segment_rngs_share_environment_and_separate_agents() -> None:
         segment_rngs(42, 0, 0, "desconocido")
 
 
+def test_run_chain_and_transcribe_can_be_cancelled() -> None:
+    """Con ``cancel`` activo, run_chain/transcribe lanzan CancelledError antes del siguiente segmento (GUI: «Cancelar»)."""
+    import threading
+
+    from src.config import CancelledError
+    from src.experiments import transcribe
+
+    data = make_chain_data()
+    cancel = threading.Event()
+    assert len(run_chain("ucb1", data, small_config(), cancel=cancel).arms) == 3  # sin cancelar, completa
+    cancel.set()
+    with pytest.raises(CancelledError, match="segmento 0 de 3"):
+        run_chain("ucb1", data, small_config(), cancel=cancel)
+    with pytest.raises(CancelledError):
+        transcribe(make_analysis(data, None), "softmax", small_config(), cancel=cancel)
+
+
 def test_run_chain_rejects_unknown_algorithm() -> None:
     """Un algoritmo desconocido en run_chain es un error con mensaje en español."""
     with pytest.raises(ValueError, match="desconocido"):
@@ -794,6 +811,17 @@ def test_live_session_reset_replays_and_matches_chain() -> None:
     np.testing.assert_allclose([e.reward for e in live.events], chain.rewards[0])
 
 
+def test_live_session_log_shows_master_seed_and_run(caplog: pytest.LogCaptureFixture) -> None:
+    """Regresión: el log dice la semilla MAESTRA (la que muestra En vivo) y aparte la corrida, no «semilla 0»."""
+    import logging
+
+    cfg = small_config()
+    cfg.experiment.seed = 42
+    with caplog.at_level(logging.INFO, logger="src.experiments"):
+        LiveSession(make_chain_data()[0], "ucb1", cfg, prev_fret=0, seed=0)
+    assert "semilla 42, corrida 0" in caplog.text
+
+
 def test_live_session_text_example_format() -> None:
     """El texto de un pull sigue el formato 't=… | UCB1 → … | frame #…: S=… − pen … = r … | Q …→…'."""
     data = make_chain_data()[0]
@@ -833,6 +861,35 @@ def test_cli_parser_and_table() -> None:
     # La ayuda de --runs y --budget muestra los valores de la configuración por defecto.
     help_text = cli.build_parser()._subparsers._group_actions[0].choices["experiment"].format_help()
     assert f"{Config().experiment.n_runs})" in help_text and f"{Config().env.budget})" in help_text
+
+
+def test_gui_mode_separates_options_from_the_audio_path(monkeypatch: pytest.MonkeyPatch,
+                                                        capsys: pytest.CaptureFixture) -> None:
+    """Regresión: sin --cli, «--quiet»/«--verbose» ajustan la consola y NO se pasan a la GUI como ruta del audio."""
+    import logging
+
+    import main as cli
+
+    launched: list[list[str]] = []
+    monkeypatch.setattr(cli, "launch_gui", lambda argv: launched.append(list(argv)) or 0)
+    root = logging.getLogger()
+    saved_level, saved_handlers = root.level, list(root.handlers)
+    try:
+        assert cli.main(["--quiet", "C:/x/money.mp3"]) == 0
+        assert launched[-1] == ["C:/x/money.mp3"]
+        assert root.level == logging.INFO  # la pestaña Log sigue recibiendo INFO
+        assert all(h.level == logging.WARNING for h in root.handlers)  # la consola, solo avisos
+        assert cli.main(["--verbose"]) == 0 and launched[-1] == []
+        assert root.level == logging.DEBUG
+        assert cli.main(["pista.mp3"]) == 0 and launched[-1] == ["pista.mp3"]
+        assert cli.main(["--runs", "5"]) == 2  # opción de la CLI sin --cli: se explica, no se abre la GUI
+        assert "--cli" in capsys.readouterr().err and len(launched) == 3
+    finally:
+        for handler in list(root.handlers):
+            root.removeHandler(handler)
+        for handler in saved_handlers:
+            root.addHandler(handler)
+        root.setLevel(saved_level)
 
 
 def test_cli_reports_config_and_output_errors_without_traceback(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:

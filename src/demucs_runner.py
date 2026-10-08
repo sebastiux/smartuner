@@ -204,15 +204,27 @@ def _import_backend() -> tuple[Any, Any, Any]:
     ------
     RunnerError
         Con :data:`EXIT_MISSING_DEPS` si falta alguno (o está roto).
+
+    Notes
+    -----
+    Además de ``ImportError`` se captura ``OSError``: en Windows, un PyTorch
+    instalado sin el Redistributable de Visual C++ falla al importarse con
+    ``OSError: [WinError 126] ... c10.dll`` (falta una DLL). ``find_spec`` sí
+    lo encuentra, así que el método «auto» elige Demucs y, sin esta captura,
+    el proceso terminaría con un traceback y sin línea ``ERROR:``.
     """
     try:
         import torch  # noqa: PLC0415 - import pesado, solo en el subproceso
         from demucs import apply as demucs_apply  # noqa: PLC0415
         from demucs import pretrained as demucs_pretrained  # noqa: PLC0415
-    except ImportError as exc:
+    except (ImportError, OSError) as exc:
+        windows_hint = ""
+        if isinstance(exc, OSError) or sys.platform == "win32":
+            windows_hint = (" En Windows, si el error menciona una DLL (WinError 126), instala el Redistributable "
+                            "de Visual C++ 2015-2022 (x64) o reinstala torch (pip install --force-reinstall torch).")
         raise RunnerError(
             f"No se pudo importar PyTorch/Demucs ({exc}). Instálalo con: pip install demucs "
-            "(instala también PyTorch para CPU).", EXIT_MISSING_DEPS) from exc
+            f"(instala también PyTorch para CPU).{windows_hint}", EXIT_MISSING_DEPS) from exc
     return torch, demucs_apply, demucs_pretrained
 
 

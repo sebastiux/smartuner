@@ -269,3 +269,55 @@ def test_pyin_transition_parameters_come_from_config(monkeypatch: pytest.MonkeyP
     assert track.voiced.all()
     # Valores por defecto: los que evitan los errores de octava (ver PitchConfig).
     assert (PitchConfig().max_transition_rate, PitchConfig().switch_prob) == (150.0, 0.1)
+
+
+def _long_bass_line(n_notes: int, rng: np.random.Generator) -> np.ndarray:
+    """Línea de bajo de ``n_notes`` notas de 0.4 s (+0.1 s de silencio) recorriendo TEST_F0S, filtrada a 400 Hz."""
+    parts: list[np.ndarray] = []
+    for i in range(n_notes):
+        parts += [_bass_tone(TEST_F0S[i % len(TEST_F0S)], NOTE_S, rng), np.zeros(int(GAP_S * SR))]
+    y = _lowpass(np.concatenate(parts))
+    return (0.9 * y / np.max(np.abs(y))).astype(np.float32)
+
+
+def test_blockwise_pyin_matches_a_single_call() -> None:
+    """Regresión (GUI congelada ~15 s con una canción): pYIN por bloques da los MISMOS frames que una sola llamada.
+
+    Bloques de 2 s con 1 s de contexto sobre una pista de 8 s: misma longitud y
+    tiempos, misma decisión de voz y la misma f0 (±½ semitono) en cada frame.
+    """
+    y = _long_bass_line(16, np.random.default_rng(3))   # 16 × 0.5 s = 8 s
+    whole = estimate_pitch_track(y, SR, PitchConfig(), hop_length=HOP)
+    fractions: list[float] = []
+    blocks = estimate_pitch_track(y, SR, PitchConfig(), hop_length=HOP, block_s=2.0, overlap_s=1.0,
+                                  progress=lambda f, _m: fractions.append(f))
+    block = int(2.0 * SR) // HOP * HOP                     # los bloques empiezan en múltiplos del hop
+    n_blocks = -(-y.size // block)
+    assert len(fractions) == n_blocks + 1 >= 4              # un aviso por bloque + el final
+    assert fractions == sorted(fractions) and fractions[-1] == 1.0
+    np.testing.assert_allclose(blocks.times_s, whole.times_s)
+    assert np.mean(blocks.voiced != whole.voiced) < 0.01
+    both = blocks.voiced & whole.voiced
+    assert np.all(np.abs(12.0 * np.log2(blocks.f0_hz[both] / whole.f0_hz[both])) < 0.5)
+
+
+def test_blockwise_pyin_can_be_cancelled_between_blocks() -> None:
+    """Con ``cancel`` activo, pYIN por bloques se detiene con CancelledError (la GUI puede cancelar el análisis)."""
+    import threading
+
+    from src.config import CancelledError
+
+    cancel = threading.Event()
+    calls: list[float] = []
+
+    def progress(fraction: float, _message: str) -> None:
+        """Cancela al empezar el segundo bloque."""
+        calls.append(fraction)
+        if len(calls) == 2:
+            cancel.set()
+
+    y = _long_bass_line(8, np.random.default_rng(4))    # 4 s → bloques de 1 s
+    with pytest.raises(CancelledError, match="bloque 3"):
+        estimate_pitch_track(y, SR, PitchConfig(), hop_length=HOP, block_s=1.0, overlap_s=0.5,
+                             progress=progress, cancel=cancel)
+    assert len(calls) == 2

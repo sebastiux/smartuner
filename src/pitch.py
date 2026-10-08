@@ -57,16 +57,23 @@ Ejemplo
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from dataclasses import dataclass
 
 import librosa
 import numpy as np
 
-from src.config import PitchConfig
+from src.config import CancelledError, PitchConfig, ProgressCallback
 from src.segmentation import Segment
 
 logger = logging.getLogger(__name__)
+
+#: Duración (s) de cada bloque de pYIN en pistas largas (ver :func:`estimate_pitch_track`).
+PYIN_BLOCK_S: float = 15.0
+
+#: Contexto (s) que se añade a cada lado de un bloque y luego se descarta.
+PYIN_OVERLAP_S: float = 2.0
 
 #: Probabilidad de voz mínima (0–1) para aceptar un frame como "con voz".
 #: El Viterbi de pYIN a veces marca como sonoros tramos de ruido blanco con
@@ -198,12 +205,94 @@ def midi_to_name(midi: int) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _pyin(y: np.ndarray, sr: int, cfg: PitchConfig, hop_length: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Una llamada a ``librosa.pyin`` con los parámetros de ``cfg`` → ``(f0, voiced_flag, voiced_prob)``."""
+    # max_transition_rate y switch_prob controlan las transiciones del HMM:
+    # un bajo salta más de una octava entre notas cortas y el valor de librosa
+    # (35.92 oct/s) hace que la f0 de la nota anterior "se arrastre" por la
+    # suboctava (ver PitchConfig).
+    f0, voiced_flag, voiced_prob = librosa.pyin(
+        y=y,
+        fmin=float(cfg.fmin_hz),
+        fmax=float(cfg.fmax_hz),
+        sr=sr,
+        frame_length=int(cfg.frame_length),
+        hop_length=int(hop_length),
+        max_transition_rate=float(cfg.max_transition_rate),
+        switch_prob=float(cfg.switch_prob),
+    )
+    return np.asarray(f0, dtype=float), np.asarray(voiced_flag, dtype=bool), np.asarray(voiced_prob, dtype=float)
+
+
+def _pyin_blocks(
+    y: np.ndarray,
+    sr: int,
+    cfg: PitchConfig,
+    hop_length: int,
+    block_s: float,
+    overlap_s: float,
+    progress: ProgressCallback | None,
+    cancel: threading.Event | None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """pYIN por bloques solapados; mismas salidas (y mismos frames) que una sola llamada.
+
+    Cada bloque cubre ``block_s`` segundos y se analiza con ``overlap_s``
+    segundos de contexto a cada lado, que luego se descartan::
+
+        señal   |-------- bloque 1 --------|-------- bloque 2 --------|---- ...
+        pYIN    [ctx|      bloque 1     |ctx]
+                               [ctx|      bloque 2     |ctx]
+        se usa       ^^^^^^^^^^^^^^^^^^^      ^^^^^^^^^^^^^^^^^^^
+
+    Los bordes empiezan en múltiplos de ``hop_length``, así que el frame j de
+    un bloque que empieza en la muestra ``lo`` es el frame ``lo/hop + j`` de la
+    pista completa (``center=True``: el frame k está centrado en ``k·hop``).
+
+    Raises
+    ------
+    CancelledError
+        Si ``cancel`` se activa entre dos bloques.
+    """
+    hop = int(hop_length)
+    n = y.size
+    n_frames = 1 + n // hop  # frames de librosa.pyin con center=True
+    block = max(hop, int(block_s * sr) // hop * hop)
+    overlap = int(overlap_s * sr) // hop * hop
+    f0 = np.full(n_frames, np.nan)
+    voiced_flag = np.zeros(n_frames, dtype=bool)
+    voiced_prob = np.zeros(n_frames)
+    n_blocks = -(-n // block)  # techo
+    for b, start in enumerate(range(0, n, block)):
+        if cancel is not None and cancel.is_set():
+            raise CancelledError(f"pYIN cancelado por el usuario (bloque {b + 1} de {n_blocks}).")
+        if progress is not None:
+            progress(b / n_blocks, f"Etapa 5/6 — Pitch: pYIN, bloque {b + 1} de {n_blocks} "
+                                   f"({start / sr:.0f}–{min(start + block, n) / sr:.0f} s)")
+        lo, hi = max(0, start - overlap), min(n, start + block + overlap)
+        f_b, v_b, p_b = _pyin(y[lo:hi], sr, cfg, hop)
+        g0 = start // hop                                               # primer frame global del bloque
+        g1 = n_frames if start + block >= n else (start + block) // hop  # el último bloque llega al final
+        k0 = g0 - lo // hop                                             # el mismo frame dentro del bloque
+        m = min(g1 - g0, f_b.size - k0)
+        f0[g0:g0 + m] = f_b[k0:k0 + m]
+        voiced_flag[g0:g0 + m] = v_b[k0:k0 + m]
+        voiced_prob[g0:g0 + m] = p_b[k0:k0 + m]
+    if progress is not None:
+        progress(1.0, f"Etapa 5/6 — Pitch: pYIN terminado ({n_blocks} bloques)")
+    return f0, voiced_flag, voiced_prob
+
+
 def estimate_pitch_track(
     y: np.ndarray,
     sr: int,
     cfg: PitchConfig,
     hop_length: int = 256,
     min_voiced_prob: float = MIN_VOICED_PROB,
+    *,
+    progress: ProgressCallback | None = None,
+    cancel: threading.Event | None = None,
+    block_s: float = PYIN_BLOCK_S,
+    overlap_s: float = PYIN_OVERLAP_S,
 ) -> PitchTrack:
     """Ejecuta pYIN sobre toda la señal y devuelve la trayectoria de f0.
 
@@ -227,6 +316,14 @@ def estimate_pitch_track(
     min_voiced_prob : float, optional
         Probabilidad de voz mínima para considerar un frame con voz (ver
         :data:`MIN_VOICED_PROB`).
+    progress : ProgressCallback | None, optional
+        ``progress(fracción_0_1, mensaje)`` al empezar cada bloque (solo en
+        pistas largas, que se procesan por bloques).
+    cancel : threading.Event | None, optional
+        Si se activa, se lanza :class:`src.config.CancelledError` antes del
+        siguiente bloque.
+    block_s, overlap_s : float, optional
+        Duración de cada bloque y contexto a cada lado, en segundos (ver Notes).
 
     Returns
     -------
@@ -234,11 +331,26 @@ def estimate_pitch_track(
         Tiempos (centro de cada frame, ``librosa.times_like``), f0 en Hz
         (NaN sin voz), probabilidad de voz y máscara de frames con voz.
 
+    Raises
+    ------
+    CancelledError
+        Si ``cancel`` se activa entre dos bloques.
+
     Notes
     -----
     pYIN es la etapa más lenta del análisis (≈ 0.02–0.1 s por segundo de
-    audio tras la primera llamada, que compila el código con numba). Por eso
-    se llama una sola vez por pista y la GUI la ejecuta en un hilo aparte.
+    audio tras la primera llamada, que compila el código con numba), así que
+    la GUI la ejecuta en un hilo aparte. Pero el Viterbi de librosa (numba
+    sin ``nogil``) **retiene el GIL** todo lo que dura: con una canción de
+    6 min, una sola llamada congela la ventana ~15 s (no se repinta, ni
+    «Cancelar» ni cerrar responden). Por eso, si la pista dura más de
+    ``block_s + 2·overlap_s``, pYIN se ejecuta por **bloques solapados**
+    (:func:`_pyin_blocks`): el GIL se libera entre bloques (< 1 s cada uno) y
+    se puede cancelar. Los ``overlap_s`` segundos de contexto a cada lado
+    dan al HMM la continuidad que tendría con la pista entera: en una pista
+    real de 6 min (993 notas) ningún frame cambió su decisión de voz ni
+    ningún segmento su f0. Las pistas cortas (el dataset sintético) siguen
+    usando una sola llamada.
     """
     y = np.asarray(y, dtype=np.float32)
     if y.size == 0:
@@ -246,20 +358,10 @@ def estimate_pitch_track(
         return PitchTrack(empty, empty.copy(), empty.copy(), np.zeros(0, dtype=bool))
 
     t0 = time.perf_counter()
-    # max_transition_rate y switch_prob controlan las transiciones del HMM:
-    # un bajo salta más de una octava entre notas cortas y el valor de librosa
-    # (35.92 oct/s) hace que la f0 de la nota anterior "se arrastre" por la
-    # suboctava (ver PitchConfig).
-    f0, voiced_flag, voiced_prob = librosa.pyin(
-        y=y,
-        fmin=float(cfg.fmin_hz),
-        fmax=float(cfg.fmax_hz),
-        sr=sr,
-        frame_length=int(cfg.frame_length),
-        hop_length=int(hop_length),
-        max_transition_rate=float(cfg.max_transition_rate),
-        switch_prob=float(cfg.switch_prob),
-    )
+    if y.size / sr > block_s + 2.0 * overlap_s:
+        f0, voiced_flag, voiced_prob = _pyin_blocks(y, sr, cfg, hop_length, block_s, overlap_s, progress, cancel)
+    else:
+        f0, voiced_flag, voiced_prob = _pyin(y, sr, cfg, hop_length)
     elapsed = time.perf_counter() - t0
     times = librosa.times_like(X=f0, sr=sr, hop_length=hop_length)
 

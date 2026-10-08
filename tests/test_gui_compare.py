@@ -111,9 +111,9 @@ def figure_text(tab: Any) -> str:
 
 def display_columns(tab: Any) -> list[str]:
     """Columnas visibles de la tabla."""
-    from gui.tabs.compare_tab import _display_columns
+    from gui.widgets import tree_display_columns
 
-    return _display_columns(tab.table)
+    return tree_display_columns(tab.table)
 
 
 def click_figure(tab: Any, x_data: float, y_data: float) -> None:
@@ -376,6 +376,9 @@ def test_every_plot_draws_with_its_description(app: Any, tab: Any) -> None:
         assert tab.plot_state == "plot", spec.key
         assert tab.plot.figure.axes
         assert spec.description[:60] in tab.description.get("1.0", "end").replace("\n", " ")
+        if spec.key in ("average_reward", "cumulative_regret", "optimal_action"):
+            # Regresión: primero lo que muestran los datos (el texto no contradice a la gráfica).
+            assert tab.description.get("1.0", "end").startswith("En este experimento"), spec.key
         assert tab.plot_counter.cget("text") == f"Gráfica {i + 1} de {n}"
     # ◀ ▶: al final ▶ está deshabilitado; ◀ retrocede.
     assert tab.next_button.instate(["disabled"])
@@ -488,13 +491,14 @@ def test_exports(app: Any, experiment: Any, tab: Any, tmp_path: Path, monkeypatc
 
 
 def test_table_headings_explain_each_column(app: Any, tab: Any) -> None:
-    """Cada encabezado visible tiene su explicación (tooltip) y ``column_at`` identifica la columna."""
+    """Cada encabezado visible tiene su explicación (tooltip) y ``tree_heading_at`` identifica la columna."""
     from gui.tabs.compare_tab import ALGORITHM_COLUMN_HELP, TABLE_COLUMNS
+    from gui.widgets import tree_heading_at
 
     tree = tab.table
     pump(app, 0.1)
     x = 5
-    assert tab.table_tooltip.column_at(x, 8) == "#0"
+    assert tree_heading_at(tree, x, 8) == "#0"
     assert tab._column_help("#0") == ALGORITHM_COLUMN_HELP
     x += int(tree.column("#0", "width"))
     helps = {c.key: c.help for c in TABLE_COLUMNS}
@@ -502,11 +506,11 @@ def test_table_headings_explain_each_column(app: Any, tab: Any) -> None:
         width = int(tree.column(key, "width"))
         if x + width // 2 > tree.winfo_width():
             break  # columna fuera de la vista (desplazamiento horizontal)
-        assert tab.table_tooltip.column_at(x + width // 2, 8) == key
+        assert tree_heading_at(tree, x + width // 2, 8) == key
         assert tab._column_help(key) == helps[key] != ""
         x += width
     # Fuera de los encabezados (sobre las filas) no hay tooltip de columna.
-    assert tab.table_tooltip.column_at(40, 60) is None
+    assert tree_heading_at(tree, 40, 60) is None
 
 
 def test_busy_and_stale_config(app: Any, tab: Any) -> None:

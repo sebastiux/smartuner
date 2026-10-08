@@ -944,6 +944,11 @@ class ParamSpec:
         Opciones válidas cuando ``kind == "choice"``.
     unit : str
         Unidad mostrada junto al control (``"Hz"``, ``"s"``, ``"dB"``...).
+    choice_labels : tuple[tuple[str, str], ...]
+        Texto en español que la GUI muestra para cada opción, como pares
+        ``(valor, etiqueta)`` (p. ej. ``("most_pulled", "más jalado (robusto)")``);
+        el valor guardado en la configuración sigue siendo el identificador.
+        Las opciones sin etiqueta se muestran tal cual.
     """
 
     label: str
@@ -954,6 +959,34 @@ class ParamSpec:
     step: float | None = None
     choices: tuple[str, ...] = ()
     unit: str = ""
+    choice_labels: tuple[tuple[str, str], ...] = ()
+
+    def choice_label(self, value: str) -> str:
+        """Etiqueta en español de la opción ``value`` (o ``value`` si no tiene).
+
+        Examples
+        --------
+        >>> PARAM_SPECS["agent.recommend"].choice_label("greedy")
+        'mayor Q (greedy)'
+        >>> PARAM_SPECS["agent.recommend"].choice_label("otra")
+        'otra'
+        """
+        return dict(self.choice_labels).get(value, value)
+
+    def choice_value(self, text: str) -> str | None:
+        """Valor de la opción cuya etiqueta (o cuyo identificador) es ``text``; None si no existe.
+
+        Examples
+        --------
+        >>> PARAM_SPECS["agent.recommend"].choice_value("más jalado (robusto)")
+        'most_pulled'
+        >>> PARAM_SPECS["agent.recommend"].choice_value("greedy"), PARAM_SPECS["agent.recommend"].choice_value("x")
+        ('greedy', None)
+        """
+        for value in self.choices:
+            if text in (value, self.choice_label(value)):
+                return value
+        return None
 
 
 #: Especificación de cada parámetro editable, indexada por ``"seccion.campo"``.
@@ -966,7 +999,9 @@ PARAM_SPECS: dict[str, ParamSpec] = {
         "demucs), descarga ~80 MB de pesos la primera vez y tarda varios minutos por canción en CPU. "
         "«hpss»: separación armónico-percusiva de librosa + pasa-bajas de 1.2 kHz; tarda segundos y no "
         "necesita nada más, pero es una aproximación: quita batería, efectos percusivos y voces/platillos "
-        "agudos, no las guitarras ni los teclados graves.", "choice", choices=SEPARATION_METHODS),
+        "agudos, no las guitarras ni los teclados graves. Solo actúa si está marcada «Separar bajo de mezcla» "
+        "en la pestaña Audio.", "choice", choices=SEPARATION_METHODS,
+        choice_labels=(("auto", "automático"), ("demucs", "Demucs"), ("hpss", "HPSS"))),
     # --- Preprocesamiento / segmentación / pitch ---
     "preprocess.lowpass_hz": ParamSpec(
         "Corte pasa-bajas", "Frecuencia de corte del filtro Butterworth aplicado a la señal de "
@@ -1028,7 +1063,8 @@ PARAM_SPECS: dict[str, ParamSpec] = {
     "env.spectrum": ParamSpec(
         "Espectro", "Representación tiempo-frecuencia usada para la recompensa: STFT (ventana fija de "
         "n_fft muestras; por defecto 8192 ≈ 0.37 s) o CQT (resolución logarítmica, 1/3 de semitono, pero "
-        "ventanas de más de 1 s en el grave que mezclan notas vecinas).", "choice", choices=("cqt", "stft")),
+        "ventanas de más de 1 s en el grave que mezclan notas vecinas).", "choice", choices=("cqt", "stft"),
+        choice_labels=(("cqt", "CQT"), ("stft", "STFT"))),
     "env.tolerance_semitones": ParamSpec(
         "Tolerancia de afinación", "Al leer la energía en h·f se toma el máximo dentro de ± esta "
         "cantidad de semitonos (absorbe desafinación e inarmonicidad de la cuerda).",
@@ -1077,7 +1113,8 @@ PARAM_SPECS: dict[str, ParamSpec] = {
         "τ mínima", "Cota inferior de τ con annealing.", "float", 0.0001, 1.0, 0.001),
     "agent.recommend": ParamSpec(
         "Recomendación final", "Posición reportada al agotar el presupuesto: el brazo más jalado "
-        "(robusto) o el de mayor Q (greedy).", "choice", choices=("most_pulled", "greedy")),
+        "(robusto) o el de mayor Q (greedy).", "choice", choices=("most_pulled", "greedy"),
+        choice_labels=(("most_pulled", "más jalado (robusto)"), ("greedy", "mayor Q (greedy)"))),
     # --- Experimento ---
     "experiment.n_runs": ParamSpec(
         "Corridas", "Número de corridas independientes con semillas distintas para promediar curvas.",
@@ -1086,7 +1123,10 @@ PARAM_SPECS: dict[str, ParamSpec] = {
         "Semilla", "Semilla maestra: con la misma semilla y configuración los resultados son idénticos.",
         "int", 0, 2**31 - 1, 1),
     "experiment.sweep_runs": ParamSpec(
-        "Corridas por barrido", "Corridas por cada valor en los barridos de sensibilidad.",
+        "Corridas por barrido", "Corridas por cada valor en los barridos de sensibilidad (ε, Q₀, c, τ y λ). "
+        "En pistas de más de 50 notas se reducen automáticamente para que cada barrido cueste como el de "
+        "una pista de 50 notas (una canción de 320 notas pasa de 30 a 5 corridas por valor); el pie de esta "
+        "sección y la pestaña Comparación dicen cuántas se usarán.",
         "int", 1, 500, 5),
     "experiment.run_sweeps": ParamSpec(
         "Barridos de sensibilidad", "Ejecutar los barridos de ε, Q₀, c y τ.", "bool"),
@@ -1102,3 +1142,40 @@ PARAM_SPECS: dict[str, ParamSpec] = {
         "Tolerancia de onset", "Distancia máxima entre el onset detectado y el del ground truth para "
         "considerarlos la misma nota.", "float", 0.005, 0.5, 0.005, unit="s"),
 }
+
+#: Ayuda de las listas de barrido: qué se barre, con qué algoritmo y qué se mide.
+#: El rango válido se toma del parámetro barrido (mismo criterio que Config.validate).
+_SWEEP_HELP: dict[str, tuple[str, str]] = {
+    "experiment.sweep_epsilon": (
+        "agent.epsilon",
+        "Valores de ε que se prueban con ε-greedy (probabilidad de elegir un brazo al azar; 0 = greedy "
+        "puro, 1 = siempre al azar). Cada valor se ejecuta «Corridas por barrido» veces sobre todas las "
+        "notas y se mide la recompensa media del último 10 % de los pulls (gráfica «Sensibilidad»)."),
+    "experiment.sweep_q0": (
+        "agent.q0",
+        "Valores iniciales Q₀ que se prueban con ε-greedy optimista (α constante). Con Q₀ por encima de "
+        "la recompensa máxima (≈ 1) todos los brazos «decepcionan» al jalarlos y el agente los prueba "
+        "todos. Cada valor se ejecuta «Corridas por barrido» veces y se mide la recompensa media del "
+        "último 10 % de los pulls (gráfica «Sensibilidad»)."),
+    "experiment.sweep_c": (
+        "agent.ucb_c",
+        "Constantes de exploración c que se prueban con UCB1 (índice Q + c·√(ln t / n); c = 0 es greedy, "
+        "√2 ≈ 1.414 el UCB1 original). Cada valor se ejecuta «Corridas por barrido» veces y se mide la "
+        "recompensa media del último 10 % de los pulls (gráfica «Sensibilidad»)."),
+    "experiment.sweep_tau": (
+        "agent.tau",
+        "Temperaturas τ que se prueban con Softmax (Boltzmann): τ → 0 elige casi siempre el mayor Q; τ "
+        "grande reparte los pulls casi al azar. Cada valor se ejecuta «Corridas por barrido» veces y se "
+        "mide la recompensa media del último 10 % de los pulls (gráfica «Sensibilidad»)."),
+    "experiment.sweep_lambda": (
+        "env.lam",
+        "Pesos λ de la penalización de tocabilidad que se prueban con los cuatro algoritmos y los dos "
+        "oráculos; se mide la precisión de posición y de pitch frente al ground truth (gráfica «Efecto "
+        "de λ»; sin .gt.json se omite)."),
+}
+for _key, (_param, _text) in _SWEEP_HELP.items():
+    _base = PARAM_SPECS[_param]
+    _range = f" Rango válido: {_base.minimum:g}–{_base.maximum:g}." if _base.minimum is not None else ""
+    PARAM_SPECS[_key] = ParamSpec(PARAM_SPECS[_key].label, _text + _range + " Separa los valores con comas.",
+                                  "float_list")
+del _key, _param, _text, _base, _range

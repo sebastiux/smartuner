@@ -400,7 +400,8 @@ def test_export_buttons(app: Any, tab: Any, tmp_path: Path, monkeypatch: pytest.
     notes = app.state.transcriptions["ucb1"].notes
     for button in tab.export_buttons.values():
         button.invoke()
-    assert [c["initialfile"] for c in calls] == [f"linea_simple_tab_ucb1.{ext}" for ext in ("txt", "json", "csv")]
+    assert [c["initialfile"] for c in calls] == [f"linea_simple_tab_ucb1.{ext}"
+                                                 for ext in ("txt", "json", "csv", "mid")]
 
     txt = (tmp_path / "linea_simple_tab_ucb1.txt").read_text(encoding="utf-8")
     assert txt.startswith("Smartuner · UCB1 · linea_simple.mp3")
@@ -412,6 +413,13 @@ def test_export_buttons(app: Any, tab: Any, tmp_path: Path, monkeypatch: pytest.
     with (tmp_path / "linea_simple_tab_ucb1.csv").open(encoding="utf-8") as fh:
         rows = list(csv.DictReader(fh))
     assert [(r["string"], int(r["fret"])) for r in rows] == [(n.string, n.fret) for n in notes]
+    # MIDI: una nota por nota de la tablatura, con su pitch y su tiempo de inicio.
+    import pretty_midi
+
+    midi = pretty_midi.PrettyMIDI(str(tmp_path / "linea_simple_tab_ucb1.mid"))
+    played = midi.instruments[0].notes
+    assert [n.pitch for n in played] == [n.midi for n in notes]
+    assert [n.start for n in played] == pytest.approx([n.start_s for n in notes], abs=2e-3)  # resolución MIDI
     assert "guardada" in app.status.message.cget("text")
 
     # Cancelar el diálogo no escribe nada.
@@ -433,9 +441,9 @@ def test_export_all_menu(app: Any, tab: Any, tmp_path: Path, monkeypatch: pytest
         f"linea_simple_tab_{alg}.csv" for alg in ALGORITHMS)
 
     monkeypatch.setattr(filedialog, "askdirectory", lambda **_k: str(tmp_path / "todo"))
-    menu.invoke(labels["En los tres formatos…"])
+    menu.invoke(labels["En todos los formatos…"])
     files = sorted(p.name for p in (tmp_path / "todo").iterdir())
-    assert len(files) == 12
+    assert len(files) == 16 and "linea_simple_tab_egreedy.mid" in files
     data = json.loads((tmp_path / "todo" / "linea_simple_tab_softmax.json").read_text(encoding="utf-8"))
     assert [n["label"] for n in data["notes"]] == [n.label for n in app.state.transcriptions["softmax"].notes]
 
@@ -588,3 +596,344 @@ def test_small_window_uses_compact_layout(app: Any, tab: Any) -> None:
         wait_until(app, lambda: not tab.compact, timeout=5)
         pump(app, 0.2)
     assert int(tab.canvas.cget("height")) == big_height
+
+
+# ---------------------------------------------------------------------------
+# Escuchar la tablatura (MIDI sintetizado con cursor)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def listen(app: Any, tab: Any) -> Iterator[tuple[Any, Any, Any]]:
+    """Reproductor de la pestaña con sounddevice y reloj FALSOS (sin tarjeta de sonido, deterministas).
+
+    Devuelve ``(reproductor, sounddevice_falso, reloj_falso)``. La síntesis
+    (Karplus-Strong, rápida) corre de verdad como tarea de la aplicación.
+    """
+    from gui.playback import SoundDeviceOutput
+    from tests.test_gui_playback import FakeClock, FakeSoundDevice
+
+    player = tab.playback
+    saved = (player._output, player._clock)
+    fake, clock = FakeSoundDevice(), FakeClock()
+    player.stop()
+    player._output = SoundDeviceOutput(fake)
+    player._clock = clock
+    player.method = "karplus-strong"
+    tab.play_mode_var.set("midi")
+    player.mode = "midi"
+    tab.follow_var.set(True)
+    yield player, fake, clock
+    player.stop()
+    player._output, player._clock = saved
+
+
+def wait_playing(app: Any, player: Any, timeout: float = 60.0) -> None:
+    """Espera a que termine la síntesis en segundo plano y empiece a sonar."""
+    wait_until(app, lambda: player.state == "playing" and not app.busy, timeout=timeout)
+    pump(app, 0.05)
+
+
+def cursor_x(tab: Any) -> float:
+    """x (lienzo) de la línea del cursor de reproducción."""
+    line = next(i for i in tab.canvas.find_withtag("playcursor") if tab.canvas.type(i) == "line")
+    return tab.canvas.coords(line)[0]
+
+
+def test_listen_row_controls(app: Any, tab: Any) -> None:
+    """La fila «Escuchar» tiene ▶, ■, tiempo, los cuatro modos, el sintetizador y «Seguir»."""
+    from src.tab import PLAYBACK_MODES
+
+    assert set(tab.mode_radios) == set(PLAYBACK_MODES)
+    assert tab.btn_play.instate(["!disabled"]) and tab.btn_play.cget("text") == "▶ Reproducir"
+    assert tab.btn_stop.instate(["disabled"])  # parado: nada que detener
+    assert tab.play_time_label.cget("text").startswith("0:00.0 / 0:1")  # pista de ~11 s
+    assert "Automática" in tab.synth_combo.cget("values")
+    assert tab.follow_var.get() is True
+    assert "regla" in tab.hint_label.cget("text") and "espacio" in tab.hint_label.cget("text")
+    # Mientras hay otra tarea en curso no se puede empezar a escuchar.
+    app.state.events.emit("busy_changed", busy=True)
+    try:
+        assert tab.btn_play.instate(["disabled"])
+    finally:
+        app.state.events.emit("busy_changed", busy=False)
+    assert tab.btn_play.instate(["!disabled"])
+
+
+def test_play_cursor_moves_and_highlights_the_sounding_note(app: Any, tab: Any, listen: Any) -> None:
+    """▶ con una nota seleccionada empieza 1 s antes; el cursor avanza y la nota que suena se rodea en verde."""
+    from gui.tabs.tablature_tab import PLAY_PREROLL_S
+
+    player, fake, clock = listen
+    notes = tab.notes
+    tab.select(4)
+    tab.btn_play.invoke()
+    assert player.state == "preparing" and tab.btn_play.cget("text") == "Sintetizando…"
+    wait_playing(app, player)
+    start = notes[4].start_s - PLAY_PREROLL_S
+    assert player.position_s == pytest.approx(start)
+    assert len(fake.plays) == 1
+    data, rate = fake.plays[0]
+    assert rate == app.state.analysis.sr and data.ndim == 1  # modo MIDI: mono
+    assert tab.btn_play.cget("text") == "⏸ Pausa" and tab.btn_stop.instate(["!disabled"])
+    assert cursor_x(tab) == pytest.approx(tab.x_of(start))
+
+    # El reloj avanza hasta el centro de la nota 4: el cursor la alcanza y se resalta.
+    target = (notes[4].start_s + notes[4].end_s) / 2
+    clock.advance(target - start)
+    pump(app, 0.1)
+    assert cursor_x(tab) == pytest.approx(tab.x_of(target))
+    assert player.note_at(target) == 4 and tab._playing_pos == 4
+    (ring,) = tab.canvas.find_withtag("playing")
+    x0, y0, x1, y1 = tab.canvas.bbox(ring)
+    bx0, by0, bx1, by1 = tab.note_bbox(4)
+    assert x0 < bx0 and y0 < by0 and x1 > bx1 and y1 > by1  # rodea el recuadro de la nota
+    assert app.state.selected_position == 4  # sonar no cambia la selección (no redibuja el espectro)
+    assert "0:0" in tab.play_time_label.cget("text")
+
+    # Espacio = pausa / reanudar (desde el mismo instante).
+    tab.canvas.focus_force()
+    tab.canvas.event_generate("<space>")
+    pump(app, 0.05)
+    assert player.state == "paused" and tab.btn_play.cget("text") == "▶ Reanudar"
+    assert tab.canvas.find_withtag("playcursor")  # en pausa el cursor se queda
+    tab.canvas.event_generate("<space>")
+    pump(app, 0.05)
+    assert player.state == "playing" and player.position_s == pytest.approx(target)
+    assert len(fake.plays) == 2
+
+    tab.btn_stop.invoke()
+    pump(app, 0.05)
+    assert player.state == "stopped"
+    assert not tab.canvas.find_withtag("playcursor") and not tab.canvas.find_withtag("playing")
+    assert tab.btn_play.cget("text") == "▶ Reproducir" and tab.btn_stop.instate(["disabled"])
+
+
+def test_change_mode_and_algorithm_while_playing(app: Any, tab: Any, listen: Any) -> None:
+    """Cambiar de modo (A/B estéreo) o de algoritmo mientras suena continúa desde el mismo instante."""
+    player, fake, clock = listen
+    tab.play_from(2.0)
+    wait_playing(app, player)
+    clock.advance(1.5)
+    pump(app, 0.05)
+    tab.mode_radios["estereo"].invoke()
+    pump(app, 0.05)
+    assert player.state == "playing" and player.mode == "estereo"
+    data, rate = fake.plays[-1]
+    assert data.ndim == 2 and data.shape[1] == 2  # original a la izquierda, MIDI a la derecha
+    assert player.position_s == pytest.approx(3.5)
+    total = int(round(player.duration_s * rate))
+    assert data.shape[0] == total - int(round(3.5 * rate))
+
+    # Otro algoritmo: la tablatura cambia y la reproducción sigue en el mismo instante.
+    clock.advance(0.5)
+    tab.algo_radios["softmax"].invoke()
+    wait_until(app, lambda: player.state == "playing" and not app.busy, timeout=60)
+    pump(app, 0.05)
+    assert player.position_s == pytest.approx(4.0, abs=0.05)
+    assert [n.position for n in player.notes] == [n.position for n in app.state.transcriptions["softmax"].notes]
+    assert tab.canvas.find_withtag("playcursor")
+
+
+def test_click_on_ruler_plays_from_there(app: Any, tab: Any, listen: Any) -> None:
+    """Un clic en la regla de tiempo escucha desde ese instante (y salta si ya sonaba)."""
+    from gui.tabs.tablature_tab import X0
+
+    player, _fake, _clock = listen
+    tab.canvas.xview_moveto(0.0)
+    pump(app, 0.05)
+    x = int(X0 + 3.0 * tab.zoom)
+    tab.canvas.event_generate("<Button-1>", x=x, y=5)
+    tab.canvas.event_generate("<ButtonRelease-1>", x=x, y=5)
+    wait_playing(app, player)
+    assert player.position_s == pytest.approx(3.0, abs=1.0 / tab.zoom)
+    # Ya sonando: otro clic salta al nuevo instante sin volver a sintetizar.
+    x = int(X0 + 6.0 * tab.zoom - tab.canvas.canvasx(0))
+    tab.canvas.event_generate("<Button-1>", x=x, y=5)
+    pump(app, 0.05)
+    assert player.state == "playing" and player.position_s == pytest.approx(6.0, abs=2.0 / tab.zoom)
+    # Un clic fuera de la regla (sobre las cuerdas) no reproduce desde ahí.
+    tab.stop_playback()
+    tab.canvas.event_generate("<Button-1>", x=x, y=int(tab._layout.main_lines["E"]))
+    pump(app, 0.05)
+    assert player.state == "stopped"
+
+
+def test_follow_pages_the_view_with_the_cursor(app: Any, tab: Any, listen: Any) -> None:
+    """Con «Seguir», cuando el cursor pasa del 85 % del ancho visible la vista avanza una página."""
+    from gui.tabs.tablature_tab import FOLLOW_MARGIN
+
+    player, _fake, clock = listen
+    tab.set_zoom(600)
+    tab.canvas.xview_moveto(0.0)
+    pump(app, 0.1)
+    tab.play_from(0.0)
+    wait_playing(app, player)
+    left, right = tab.visible_range()
+    t_edge = (left + FOLLOW_MARGIN * (right - left) + 20 - tab.x_of(0)) / tab.zoom
+    clock.advance(t_edge)
+    pump(app, 0.1)
+    new_left, new_right = tab.visible_range()
+    x = cursor_x(tab)
+    assert new_left > left and new_left <= x <= new_left + 0.2 * (new_right - new_left)
+    # Sin «Seguir» la vista no se mueve.
+    tab.follow_var.set(False)
+    clock.advance((new_right - new_left) / tab.zoom)
+    pump(app, 0.1)
+    assert tab.visible_range()[0] == pytest.approx(new_left)
+
+
+def test_only_one_player_at_a_time(app: Any, tab: Any, listen: Any) -> None:
+    """La pestaña Audio y la Tablatura comparten la salida: al reproducir una, la otra se detiene o pausa."""
+    from gui.widgets import AudioPlayer
+
+    player, fake, clock = listen
+    audio_tab = app.tabs["audio"]
+    saved = audio_tab.player
+    audio_tab.player = AudioPlayer(fake)
+    try:
+        tab.play_from(1.0)
+        wait_playing(app, player)
+        clock.advance(0.7)
+        audio_tab._on_play_all()  # «▶ Todo» de la pestaña Audio
+        pump(app, 0.05)
+        assert player.state == "paused" and player.position_s == pytest.approx(1.7)
+        assert len(fake.plays) == 2 and audio_tab.player.is_active()  # suena el original completo
+        stops = fake.stops
+        tab.toggle_playback()  # reanudar la tablatura: la pestaña Audio se calla
+        pump(app, 0.05)
+        assert player.state == "playing" and fake.stops > stops and not audio_tab.player.is_active()
+        assert player.position_s == pytest.approx(1.7)
+    finally:
+        audio_tab.player = saved
+
+
+def test_new_analysis_stops_playback(app: Any, tab: Any, listen: Any) -> None:
+    """Un análisis nuevo (o una re-transcripción) detiene la reproducción y borra el cursor."""
+    player, _fake, _clock = listen
+    tab.play_from(0.5)
+    wait_playing(app, player)
+    app.state.events.emit("analysis_ready", analysis=app.state.analysis)
+    app.state.events.emit("transcriptions_ready", transcriptions=app.state.transcriptions)
+    pump(app, 0.1)
+    assert player.state == "stopped" and not tab.canvas.find_withtag("playcursor")
+
+
+def test_play_without_sounddevice_opens_a_wav(app: Any, tab: Any, tmp_path: Path,
+                                               monkeypatch: pytest.MonkeyPatch) -> None:
+    """Sin salida de audio, ▶ explica el motivo en su tooltip y abre un WAV con el reproductor del sistema."""
+    import sys
+
+    from gui.playback import SoundDeviceOutput
+
+    monkeypatch.setitem(sys.modules, "sounddevice", None)
+    player = tab.playback
+    saved = (player._output, player._opener, player.export_dir)
+    opened: list[Path] = []
+    player.stop()
+    player._output, player._opener, player.export_dir = SoundDeviceOutput(), opened.append, tmp_path
+    player.method = "karplus-strong"
+    try:
+        assert "reproductor del sistema" in tab._play_help()
+        tab.play_from(0.0)
+        wait_until(app, lambda: bool(opened) and not app.busy, timeout=60)
+        assert opened[0].suffix == ".wav" and opened[0].parent == tmp_path
+        assert opened[0].name.startswith("linea_simple_")
+        assert (tmp_path / f"{opened[0].name.split('_midi')[0]}.mid").exists()
+        assert player.state == "stopped" and not tab.canvas.find_withtag("playcursor")
+        assert "no se sincroniza" in app.status.message.cget("text")
+    finally:
+        player._output, player._opener, player.export_dir = saved
+
+
+def test_new_analysis_that_starts_late_opens_on_the_first_note(app: Any, tab: Any) -> None:
+    """Regresión (Money: primera nota a 12.6 s): tras un análisis NUEVO la vista muestra la primera nota, no un
+    pentagrama vacío; una re-transcripción (misma señal) no mueve la vista."""
+    import dataclasses
+
+    import numpy as np
+
+    original_analysis, original_tr = app.state.analysis, dict(app.state.transcriptions)
+    shift = 40.0
+    sr = original_analysis.sr
+    pad = np.zeros(int(shift * sr), dtype=original_analysis.y_raw.dtype)
+
+    def moved(segment: Any) -> Any:
+        return dataclasses.replace(segment, start_s=segment.start_s + shift, end_s=segment.end_s + shift,
+                                   start_sample=segment.start_sample + pad.size,
+                                   end_sample=segment.end_sample + pad.size)
+
+    late = dataclasses.replace(
+        original_analysis, y_raw=np.concatenate([pad, original_analysis.y_raw]),
+        segments=[moved(s) for s in original_analysis.segments],
+        segment_data=[dataclasses.replace(d, segment=moved(d.segment)) for d in original_analysis.segment_data],
+        ground_truth=None)
+    late_tr = {alg: dataclasses.replace(tr, notes=[dataclasses.replace(n, start_s=n.start_s + shift,
+                                                                       end_s=n.end_s + shift) for n in tr.notes])
+               for alg, tr in original_tr.items()}
+    try:
+        app.state.analysis, app.state.transcriptions = late, late_tr
+        app.state.events.emit("analysis_ready", analysis=late)
+        app.state.events.emit("transcriptions_ready", transcriptions=late_tr)
+        pump(app, 0.3)
+        left, right = tab.visible_range()
+        first = min(tab._note_boxes.values(), key=lambda box: box[0])
+        assert left > 0 and left <= first[0] <= right
+        # Re-transcripción (misma señal): la vista se queda donde el usuario la dejó.
+        tab.canvas.xview_moveto(0.0)
+        pump(app, 0.1)
+        retranscribed = dataclasses.replace(late)
+        app.state.analysis = retranscribed
+        app.state.events.emit("analysis_ready", analysis=retranscribed)
+        app.state.events.emit("transcriptions_ready", transcriptions=late_tr)
+        pump(app, 0.3)
+        assert tab.visible_range()[0] == 0
+    finally:
+        app.state.analysis, app.state.transcriptions = original_analysis, original_tr
+        app.state.events.emit("analysis_ready", analysis=original_analysis)
+        app.state.events.emit("transcriptions_ready", transcriptions=original_tr)
+        pump(app, 0.3)
+
+
+def test_late_first_note_is_revealed_when_tab_was_hidden_during_analysis(app: Any, tab: Any) -> None:
+    """Regresión: si el análisis termina con la pestaña Tablatura OCULTA (lo normal al abrir el MP3 desde la
+    pestaña Audio), al mostrarla la vista salta igualmente a la primera nota (antes se quedaba en 0 s)."""
+    import dataclasses
+
+    import numpy as np
+
+    original_analysis, original_tr = app.state.analysis, dict(app.state.transcriptions)
+    shift = 40.0
+    pad = np.zeros(int(shift * original_analysis.sr), dtype=original_analysis.y_raw.dtype)
+
+    def moved(segment: Any) -> Any:
+        return dataclasses.replace(segment, start_s=segment.start_s + shift, end_s=segment.end_s + shift,
+                                   start_sample=segment.start_sample + pad.size,
+                                   end_sample=segment.end_sample + pad.size)
+
+    late = dataclasses.replace(
+        original_analysis, y_raw=np.concatenate([pad, original_analysis.y_raw]),
+        segments=[moved(s) for s in original_analysis.segments],
+        segment_data=[dataclasses.replace(d, segment=moved(d.segment)) for d in original_analysis.segment_data],
+        ground_truth=None)
+    late_tr = {alg: dataclasses.replace(tr, notes=[dataclasses.replace(n, start_s=n.start_s + shift,
+                                                                       end_s=n.end_s + shift) for n in tr.notes])
+               for alg, tr in original_tr.items()}
+    try:
+        app.show_tab("audio")
+        pump(app, 0.2)
+        app.state.analysis, app.state.transcriptions = late, late_tr
+        app.state.events.emit("analysis_ready", analysis=late)
+        app.state.events.emit("transcriptions_ready", transcriptions=late_tr)
+        pump(app, 0.3)
+        app.show_tab("tab")
+        pump(app, 0.5)
+        left, right = tab.visible_range()
+        first = min(tab._note_boxes.values(), key=lambda box: box[0])
+        assert left > 0 and left <= first[0] <= right
+    finally:
+        app.show_tab("tab")
+        app.state.analysis, app.state.transcriptions = original_analysis, original_tr
+        app.state.events.emit("analysis_ready", analysis=original_analysis)
+        app.state.events.emit("transcriptions_ready", transcriptions=original_tr)
+        pump(app, 0.3)

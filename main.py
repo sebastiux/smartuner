@@ -29,7 +29,8 @@ Línea de comandos (``--cli`` + subcomando)::
                                           [--out results/<nombre>_<fecha>]
 
 Opciones comunes: ``--quiet`` (solo avisos y errores) y ``--verbose``
-(detalle DEBUG). El log va a la consola con el formato
+(detalle DEBUG); también valen con la GUI (``python main.py --quiet pista.mp3``),
+donde solo cambian lo que se escribe en la consola. El log va a la consola con el formato
 ``HH:MM:SS NIVEL módulo: mensaje``. Si se escribe un subcomando sin ``--cli``
 se entiende igualmente que se quiere la línea de comandos.
 
@@ -523,6 +524,47 @@ def launch_gui(argv: list[str]) -> int:
         return 1
 
 
+#: Opciones que también acepta la GUI (las demás son exclusivas de la CLI).
+GUI_OPTIONS: tuple[str, ...] = ("--quiet", "--verbose")
+
+
+def _launch_gui_with_options(argv: list[str]) -> int:
+    """Separa opciones y rutas antes de abrir la GUI.
+
+    ``--quiet``/``--verbose`` ajustan el log de CONSOLA (la pestaña Log sigue
+    recibiendo los mensajes INFO); cualquier otra opción que empiece por «-» es
+    de la CLI y se rechaza con una explicación, en lugar de pasarla a la GUI
+    como si fuera la ruta del audio. Solo los argumentos posicionales (la ruta
+    del audio) llegan a :func:`launch_gui`.
+
+    Parameters
+    ----------
+    argv : list[str]
+        Argumentos sin ``--cli`` ni subcomando.
+
+    Returns
+    -------
+    int
+        Código de salida (2 si hay opciones desconocidas).
+    """
+    options = [a for a in argv if a.startswith("-")]
+    paths = [a for a in argv if not a.startswith("-")]
+    unknown = [a for a in options if a not in GUI_OPTIONS]
+    if unknown:
+        print(f"Opción no válida para la interfaz gráfica: {' '.join(unknown)}. Las opciones de análisis y "
+              "experimentos son de la línea de comandos: python main.py --cli --help", file=sys.stderr)
+        return 2
+    if options:
+        verbose, quiet = "--verbose" in options, "--quiet" in options
+        console_level = logging.DEBUG if verbose else (logging.WARNING if quiet else logging.INFO)
+        # El logger raíz queda como máximo en INFO para que la pestaña Log reciba la
+        # narración del sistema; --quiet solo silencia la consola.
+        setup_logging(verbose=verbose)
+        for handler in logging.getLogger().handlers:
+            handler.setLevel(console_level)
+    return launch_gui(paths)
+
+
 def main(argv: list[str] | None = None) -> int:
     """Punto de entrada: GUI sin ``--cli`` (ni subcomando); CLI en caso contrario.
 
@@ -540,7 +582,7 @@ def main(argv: list[str] | None = None) -> int:
     _ensure_utf8_output()
     wants_cli = "--cli" in argv or any(a in COMMANDS for a in argv)
     if not wants_cli and not any(a in ("-h", "--help") for a in argv):
-        return launch_gui(argv)
+        return _launch_gui_with_options(argv)
 
     parser = build_parser()
     args = parser.parse_args(argv)

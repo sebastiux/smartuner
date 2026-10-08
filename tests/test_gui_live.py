@@ -470,6 +470,11 @@ def test_auto_pause_stop_and_speed(tab: Any) -> None:
         wait_until(app, lambda: tab.session.t >= 60, timeout=10)
         tab.pause_button.invoke()
         paused_at = tab.session.t
+        # Regresión: en Auto el eje de pulls sigue en escalones redondos (no salta a [0, T]),
+        # así que la barra más alta ocupa al menos un 20 % del panel y se ve el reparto.
+        top, budget = tab.live_plot.count_top, tab.session.budget
+        assert top < budget
+        assert tab.session.agent.counts.max() >= 0.2 * top
         assert not tab.running and not disabled(tab.step_button)
         pump(app, 0.3)
         assert tab.session.t == paused_at
@@ -497,8 +502,10 @@ def test_auto_pause_stop_and_speed(tab: Any) -> None:
         assert session.done
         np.testing.assert_allclose(rewards(tab)[:20], first)
         assert session.budget / elapsed > 100                    # ≥ 100 pulls/s efectivos (pedidos: 200)
-        assert counts["blit"] >= 6                               # se repinta con blitting…
-        assert counts["full"] <= 5                               # …y casi nunca la figura entera
+        # Se repinta con blitting y la figura entera solo al empezar y al cambiar de escalón el eje
+        # de pulls (5 → 10 → 20 → 50 → 100 → 150): como mucho 6 dibujados completos.
+        assert counts["blit"] >= 3
+        assert counts["full"] <= 6
     finally:
         tab._blit = original_blit
         tab.plot.canvas.draw = original_draw
@@ -715,6 +722,39 @@ def test_hidden_tab_defers_drawing(tab: Any) -> None:
         pump(app, 0.3)
         assert not tab._dirty
         assert tab.session.t == 5
+    finally:
+        app.notebook.forget(other)
+        other.destroy()
+
+
+@gui_test
+def test_hidden_tab_defers_new_session_until_shown(tab: Any) -> None:
+    """Oculta, las selecciones de otras pestañas no reconstruyen la figura; al volver se usa la ÚLTIMA.
+
+    Regresión: con la pestaña oculta, elegir Softmax y después volver a UCB1
+    (el algoritmo de la sesión vigente) dejaba la sesión pendiente con Softmax.
+    """
+    from tkinter import ttk
+
+    app = tab.app
+    session = tab.session
+    other = ttk.Frame(app.notebook)
+    app.notebook.add(other, text="otra")
+    try:
+        app.notebook.select(other)
+        pump(app, 0.2)
+        app.state.select_segment(3, source="tablature")
+        app.state.select_algorithm("softmax")
+        app.state.select_algorithm("ucb1")
+        pump(app, 0.1)
+        assert tab.session is session  # nada se reconstruyó con la pestaña oculta
+        assert tab.position == 3 and tab.algorithm == "ucb1"
+        app.show_tab("live")
+        pump(app, 0.4)
+        assert tab.session is not session
+        assert tab.session.data.position == 3 and tab.session.algorithm == "ucb1"
+        assert tab.algo_var.get() == "UCB1"
+        assert tab.live_plot.titles["d"].get_text().startswith("(d) Índice UCB")
     finally:
         app.notebook.forget(other)
         other.destroy()

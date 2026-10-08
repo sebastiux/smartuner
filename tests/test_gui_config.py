@@ -419,3 +419,70 @@ def test_pending_changes_with_a_real_analysis(tab: Any, app: Any) -> None:
     assert tab.status_kind == "synced"
     assert app.state.analysis.config.segmentation.onset_delta == pytest.approx(0.06)
     assert "Aún no hay resultados" in tab.experiment_state_label.cget("text")
+
+
+def _label_texts(widget: Any) -> list[str]:
+    """Textos de todas las etiquetas (ttk/tk Label y LabelFrame) bajo ``widget``."""
+    texts: list[str] = []
+    for child in widget.winfo_children():
+        try:
+            text = str(child.cget("text"))
+        except tk.TclError:
+            text = ""
+        if text:
+            texts.append(text)
+        texts += _label_texts(child)
+    return texts
+
+
+@pytest.mark.gui
+@needs_display
+def test_separation_method_has_its_own_stage_2_group(tab: Any) -> None:
+    """Regresión: «Método de separación del bajo» ya no cae en «Otros parámetros»; la sección dice «Etapas 2–5»."""
+    from gui.tabs.config_tab import SECTIONS
+
+    analysis_section = next(s for s in SECTIONS if s.key == "analysis")
+    assert analysis_section.groups[0].keys == ("audio.separation_method",)
+    assert "Etapas 2–5" in analysis_section.note
+    texts = _label_texts(tab._sections["analysis"])
+    assert "Otros parámetros" not in texts
+    assert any(t.startswith("Separación del bajo (etapa 2") for t in texts)
+
+
+@pytest.mark.gui
+@needs_display
+def test_choice_fields_show_spanish_labels_and_store_identifiers(tab: Any, app: Any) -> None:
+    """Regresión: «Recomendación final» muestra «más jalado (robusto)»/«mayor Q (greedy)», no most_pulled/greedy."""
+    field = tab.fields["agent.recommend"]
+    assert field.var.get() == "más jalado (robusto)"
+    assert list(field.control.cget("values")) == ["más jalado (robusto)", "mayor Q (greedy)"]
+    _edit(tab, "agent.recommend", "mayor Q (greedy)")
+    assert app.state.config.agent.recommend == "greedy"
+    app.state.config.agent.recommend = "most_pulled"
+    app.state.events.emit("config_changed", key="agent.recommend")
+    _pump(app)
+    assert field.var.get() == "más jalado (robusto)"
+    assert tab.fields["audio.separation_method"].var.get() == "automático"
+
+
+@pytest.mark.gui
+@needs_display
+def test_footer_explains_reduced_sweep_runs_on_long_tracks(tab: Any, app: Any) -> None:
+    """Regresión: con una canción de 993 notas el pie dice cuántas corridas por valor usarán los barridos."""
+    from types import SimpleNamespace
+
+    from src.experiments import effective_sweep_runs
+
+    cfg = app.state.config
+    runs = effective_sweep_runs(cfg, 993)
+    assert runs < cfg.experiment.sweep_runs
+    app.state.analysis = SimpleNamespace(segment_data=[None] * 993, ground_truth=None)
+    try:
+        tab._update_experiment_info()
+        text = tab.estimate_label.cget("text")
+        assert f"se usarán {runs} corridas por valor (no {cfg.experiment.sweep_runs})" in text
+        assert "993 notas" in text
+        assert "50 notas" in PARAM_SPECS["experiment.sweep_runs"].help
+    finally:
+        app.state.analysis = None
+        tab._update_experiment_info()

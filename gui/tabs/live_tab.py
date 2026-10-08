@@ -721,8 +721,7 @@ def panel_title(ax: Axes, text: str) -> Text:
     Text
         El artista del título.
     """
-    return ax.set_title(text, loc="left", fontsize=plots.PANEL_TITLE_SIZE, color=plots.TEXT_PRIMARY,
-                        fontweight="bold", pad=6)
+    return plots._panel_title(ax, text)  # noqa: SLF001 - mismo estilo que las gráficas exportadas
 
 
 def arm_tick_labels(data: SegmentBanditData, optimal: Sequence[int]) -> list[str]:
@@ -1262,6 +1261,7 @@ class LiveTab(ttk.Frame):
         self._seed_follows_config = True
         self._auto_job: str | None = None
         self._rebuild_job: str | None = None
+        self._session_stale = False  # la selección cambió con la pestaña oculta: crear la sesión al mostrarla
         self._last_tick = 0.0
         self._credit = 0.0
         self._blitting = False
@@ -1764,6 +1764,7 @@ class LiveTab(ttk.Frame):
 
     def _new_session(self) -> None:
         """Crea una sesión para (segmento, algoritmo, semilla) actuales con la configuración vigente."""
+        self._session_stale = False
         self._stop_auto(redraw=False)
         segments = self._segment_data()
         if not segments:
@@ -1878,12 +1879,11 @@ class LiveTab(ttk.Frame):
         self._blitting = True
         self._background = None
         self.live_plot.set_animated(True)
-        # El eje de pulls pasa a [0, T] durante la animación: las barras «crecen» hacia su
-        # fracción final del presupuesto y no hay re-escalados (dibujados completos) a mitad.
-        relayout = self.live_plot.count_top < session.budget
-        if relayout:
-            self.live_plot.set_count_top(session.budget)
-        self._render(relayout=relayout, force_full=True)
+        # El eje de pulls (panel b) conserva sus escalones redondos (5, 10, 20, 50, 100, 200, 500):
+        # con el eje fijo en [0, T] las barras medían un 6 % del alto durante media ejecución y no
+        # se veía cómo se reparten los pulls, justo en el modo que se proyecta. Cada cambio de
+        # escalón (≈ 5 por ejecución) hace un dibujado completo; el resto del tiempo, blitting.
+        self._render(force_full=True)
         self._update_controls()
         self._auto_job = self.after(0, self._auto_tick)
 
@@ -2136,6 +2136,12 @@ class LiveTab(ttk.Frame):
         """Al mostrarse la pestaña, dibuja lo que quedó pendiente mientras estaba oculta."""
         if event.widget is not self:
             return
+        if self._session_stale:
+            self._session_stale = False
+            if self.app.state.analysis is not None and self._rebuild_job is None:
+                self._dirty = False
+                self._new_session()  # dibuja la figura completa
+                return
         if self._dirty and self.session is not None:
             self._dirty = False
             self._render(relayout=True, force_full=True)
@@ -2384,6 +2390,13 @@ class LiveTab(ttk.Frame):
             return
         if self.session is not None and valid == self.position and self.session.data.position == valid:
             return
+        if not self.winfo_ismapped():
+            # Pestaña oculta: la sesión (y su figura, ≈ 0.25 s) se crea al mostrarla. Así recorrer
+            # las notas con ← / → en la tablatura o en la pestaña Audio no espera a esta pestaña.
+            self._stop_auto(redraw=False)
+            self.position = valid
+            self._session_stale = True
+            return
         self.select_position(valid, broadcast=False)
 
     def _on_algorithm_selected(self, algorithm: str = "", **_kwargs: Any) -> None:
@@ -2391,10 +2404,14 @@ class LiveTab(ttk.Frame):
         if algorithm not in ALGORITHMS:
             return
         self.algo_var.set(ALGO_LABELS[algorithm])
-        if self.session is not None and self.session.algorithm == algorithm:
+        self.algorithm = algorithm  # siempre: una sesión pendiente (pestaña oculta) usará este
+        if self.session is not None and self.session.algorithm == algorithm and not self._session_stale:
             return
-        self.algorithm = algorithm
         if self.app.state.analysis is not None and self._rebuild_job is None:
+            if not self.winfo_ismapped():
+                self._stop_auto(redraw=False)
+                self._session_stale = True  # se crea al mostrar la pestaña (ver _on_segment_selected)
+                return
             self._new_session()
 
     def _on_config_changed(self, key: str | None = None, **_kwargs: Any) -> None:

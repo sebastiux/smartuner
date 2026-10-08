@@ -727,7 +727,12 @@ class UCB1Agent(BanditAgent):
     * Los brazos no jalados tienen N = 0 → bono infinito: por eso UCB1 empieza
       jalando cada brazo una vez.
     * Garantía: el regret crece solo logarítmicamente, O(Σ_a ln T / Δ_a), el
-      orden óptimo (Lai & Robbins).
+      orden óptimo (Lai & Robbins). Es una cota ASINTÓTICA: con brechas Δ_a
+      pequeñas (aquí, posiciones del mismo pitch casi empatadas) y T de unos
+      cientos de pulls, el término ln T / Δ_a es grande y UCB1 explora casi
+      todo el presupuesto, así que su regret puede verse casi lineal y su
+      recompensa media quedar por debajo de ε-greedy (con c menor que √2 se
+      aplana antes; ver el barrido de c en la pestaña Comparación).
 
     Aquí t es el número de pulls YA realizados (el ``n`` de Auer et al.). c
     regula el peso de la exploración: c = 0 es greedy puro.

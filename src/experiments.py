@@ -463,7 +463,8 @@ def segment_rngs(seed: int, run_index: int, segment: int, algorithm: str) -> tup
     return env_rng, agent_rng
 
 
-def run_chain(algorithm: str, segment_data: list[SegmentBanditData], cfg: Config, run_index: int = 0) -> ChainResult:
+def run_chain(algorithm: str, segment_data: list[SegmentBanditData], cfg: Config, run_index: int = 0,
+              *, cancel: threading.Event | None = None) -> ChainResult:
     """Ejecuta ``algorithm`` sobre todos los segmentos en orden (una corrida).
 
     Para cada segmento s (ver encabezado del módulo):
@@ -487,6 +488,10 @@ def run_chain(algorithm: str, segment_data: list[SegmentBanditData], cfg: Config
         Usa ``env`` (λ, T, ruido, mano inicial), ``agent`` y ``experiment.seed``.
     run_index : int, optional
         Índice de la corrida r (fija las semillas).
+    cancel : threading.Event | None, optional
+        Se consulta antes de cada segmento: con una canción entera (~1000
+        segmentos) una cadena tarda varios segundos y la GUI debe poder
+        cancelarla a mitad.
 
     Returns
     -------
@@ -497,6 +502,8 @@ def run_chain(algorithm: str, segment_data: list[SegmentBanditData], cfg: Config
     ------
     ValueError
         Si el algoritmo no existe.
+    CancelledError
+        Si ``cancel`` se activa durante la cadena.
     """
     _algorithm_index(algorithm)  # valida antes de empezar
     budget = int(cfg.env.budget)
@@ -514,6 +521,9 @@ def run_chain(algorithm: str, segment_data: list[SegmentBanditData], cfg: Config
     prev: int | None = cfg.env.initial_hand_fret
     t0 = time.perf_counter()
     for s, data in enumerate(segment_data):
+        if cancel is not None and cancel.is_set():
+            raise CancelledError(f"Transcripción con {ALGO_LABELS.get(algorithm, algorithm)} cancelada "
+                                 f"en el segmento {s} de {n_seg}.")
         env_rng, agent_rng = segment_rngs(seed, run_index, s, algorithm)
         env = BanditEnvironment.from_config(data, prev, cfg.env, env_rng)
         agent = make_agent(algorithm, data.n_arms, cfg.agent, agent_rng, explain=False)
@@ -784,7 +794,8 @@ class TranscriptionResult:
     chain: ChainResult
 
 
-def transcribe(analysis: AnalysisResult, algorithm: str, cfg: Config, run_index: int = 0) -> TranscriptionResult:
+def transcribe(analysis: AnalysisResult, algorithm: str, cfg: Config, run_index: int = 0,
+               *, cancel: threading.Event | None = None) -> TranscriptionResult:
     """Ejecuta una cadena y convierte las posiciones recomendadas en :class:`TabNote`.
 
     Parameters
@@ -797,13 +808,21 @@ def transcribe(analysis: AnalysisResult, algorithm: str, cfg: Config, run_index:
         Configuración (agente, λ, T, semilla).
     run_index : int, optional
         Corrida (semillas).
+    cancel : threading.Event | None, optional
+        Cancelación cooperativa (se consulta antes de cada segmento, ver
+        :func:`run_chain`).
 
     Returns
     -------
     TranscriptionResult
         Notas de la tablatura y la cadena que las produjo.
+
+    Raises
+    ------
+    CancelledError
+        Si ``cancel`` se activa durante la transcripción.
     """
-    chain = run_chain(algorithm, analysis.segment_data, cfg, run_index=run_index)
+    chain = run_chain(algorithm, analysis.segment_data, cfg, run_index=run_index, cancel=cancel)
     segments = [d.segment for d in analysis.segment_data]
     notes = notes_from_choices(segments, chain.arms)
     logger.info("Transcripción con %s: %d notas en %.0f ms (%s)", ALGO_LABELS.get(algorithm, algorithm),
@@ -2300,9 +2319,11 @@ class LiveSession:
         self.agent = make_agent(self.algorithm, self.data.n_arms, self.cfg.agent, agent_rng)
         self.events = []
         self.cumulative_regret = 0.0
-        logger.info("Ejecución en vivo: %s en el segmento %d (%d brazos, T=%d, traste previo %s, semilla %d)",
-                    ALGO_LABELS.get(self.algorithm, self.algorithm), self.data.position, self.data.n_arms,
-                    self.budget, self.prev_fret, self.seed)
+        # «semilla» = la semilla maestra (la que muestra la pestaña En vivo); ``self.seed`` es el
+        # ÍNDICE DE CORRIDA r con el que se derivan los generadores (ver la docstring de la clase).
+        logger.info("Ejecución en vivo: %s en el segmento %d (%d brazos, T=%d, traste previo %s, semilla %d, "
+                    "corrida %d)", ALGO_LABELS.get(self.algorithm, self.algorithm), self.data.position,
+                    self.data.n_arms, self.budget, self.prev_fret, int(self.cfg.experiment.seed), self.seed)
 
 
 __all__ = [

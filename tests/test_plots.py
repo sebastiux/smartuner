@@ -17,6 +17,7 @@ import subprocess
 import sys
 import warnings
 from collections.abc import Callable
+from typing import Any
 from dataclasses import replace
 from pathlib import Path
 
@@ -24,6 +25,7 @@ import numpy as np
 import pytest
 from matplotlib.container import BarContainer
 from matplotlib.figure import Figure
+from matplotlib.text import Annotation
 
 from src import plots
 from src.config import ALGO_COLORS, ALGO_MARKERS, ALGORITHMS, STRING_ORDER, Config
@@ -424,7 +426,7 @@ def test_arm_distribution_folds_many_arms_into_others() -> None:
     fig = plots.plot_arm_distribution(res)
     labels = [t.get_text() for t in fig.axes[0].get_xticklabels()]
     assert len(labels) == plots.MAX_ARM_GROUPS + 1
-    assert labels[-1].startswith("Otros") and f"({k - plots.MAX_ARM_GROUPS} brazos)" in labels[-1]
+    assert labels[-1].startswith("Otros") and f"{k - plots.MAX_ARM_GROUPS} brazos" in labels[-1]
     _render(fig)
     fig_q = plots.plot_q_evolution(res)
     assert "se muestran los" in _all_texts(fig_q)
@@ -456,6 +458,21 @@ def test_sensitivity_log_axes_and_current_value(res: ExperimentResult) -> None:
     assert panels["c"].get_xscale() == "log" and panels["τ"].get_xscale() == "log"
     assert panels["Q₀"].get_xscale() == "log" and panels["ε"].get_xscale() == "linear"
     assert any("actual: 0.1" in t.get_text() for t in panels["ε"].texts)
+
+
+def test_sensitivity_short_ylabel_on_short_gui_canvas(res: ExperimentResult) -> None:
+    """Regresión (GUI): en un lienzo bajo la etiqueta Y es corta y no invade el subtítulo ni el panel vecino."""
+    export = plots.plot_sensitivity(res)
+    assert export.axes[0].get_ylabel() == "Recompensa media final r"
+    gui = plots.plot_sensitivity(res, fig=Figure(figsize=(10.2, 3.6)))
+    assert gui.axes[0].get_ylabel() == "r final"
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+
+    canvas = FigureCanvasAgg(gui)
+    canvas.draw()  # constrained layout al tamaño real del lienzo (como en la GUI)
+    ax = gui.axes[0]
+    label = ax.yaxis.label.get_window_extent(canvas.get_renderer())
+    assert label.height <= ax.get_window_extent().height + 1  # cabe en el alto de su panel
 
 
 def test_sensitivity_with_partial_sweeps() -> None:
@@ -653,6 +670,59 @@ def test_audio_overview_shares_time_axis_and_highlights_selection(analysis: Anal
     _render(gui)
 
 
+def test_audio_overview_segment_numbers_are_clipped_to_the_axes(analysis: AnalysisResult) -> None:
+    """Regresión (GUI): al hacer zoom, los números de segmento fuera de la vista no se dibujan junto a los ejes."""
+    fig = plots.plot_audio_overview(analysis)
+    ax_wave = fig.axes[0]
+    assert ax_wave.texts and all(t.get_clip_on() for t in ax_wave.texts)
+
+
+def test_audio_subtitle_uses_singular_and_plural(analysis: AnalysisResult) -> None:
+    """Regresión: «1 descartado» (no «1 descartados») y «1 segmento conservado»."""
+    n_discarded = len(analysis.segments) - len(analysis.kept)
+    text = plots._audio_subtitle(analysis)  # noqa: SLF001
+    assert f"{n_discarded} descartado{'s' if n_discarded != 1 else ''} ·" in text
+    one = replace(analysis, segments=analysis.segments[:1] + [replace(analysis.segments[0], kept=False)],
+                  onsets_s=analysis.onsets_s[:1])
+    text = plots._audio_subtitle(one)  # noqa: SLF001
+    assert "1 onset ·" in text and "1 segmento conservado, 1 descartado ·" in text
+
+
+def test_audio_overview_compact_for_short_gui_canvases(analysis: AnalysisResult) -> None:
+    """``compact=True``: sin subtítulo, etiquetas Y cortas, una marca por octava y «dB» en la barra de color."""
+    gui = Figure(figsize=(9.0, 3.2))
+    fig = plots.plot_audio_overview(analysis, fig=gui, selected=1, compact=True)
+    ax_wave, ax_spec, cax = fig.axes[0], fig.axes[1], fig.axes[2]
+    assert ax_wave.get_ylabel() == "Amplitud" and ax_spec.get_ylabel() == "Hz (log)"
+    assert cax.get_ylabel() == "dB"
+    labels = [t.get_text().split(" ")[0] for t in ax_spec.get_yticklabels()]
+    assert labels and set(labels) <= set(plots.COMPACT_NOTE_TICKS)
+    assert not any(isinstance(a, Annotation) for a in fig.artists)  # sin subtítulo
+    assert "Seg. 1" in _title(fig)
+    _render(fig)
+
+
+def test_drop_subtitle_removes_annotation_and_reserved_lines(res: ExperimentResult) -> None:
+    """:func:`src.plots.drop_subtitle` quita el subtítulo y las líneas en blanco que le reservaba el título."""
+    fig = plots.plot_average_reward(res)
+    assert any(isinstance(a, Annotation) for a in fig.artists)
+    plots.drop_subtitle(fig)
+    assert not any(isinstance(a, Annotation) for a in fig.artists)
+    assert not fig._suptitle.get_text().endswith("\n")  # noqa: SLF001
+    plots.drop_subtitle(Figure())  # sin título: no falla
+    _render(fig)
+
+
+def test_panel_title_returns_the_text_artist() -> None:
+    """``_panel_title`` devuelve el título para poder cambiarlo después (vista en vivo)."""
+    fig = Figure()
+    ax = fig.add_subplot()
+    title = plots._panel_title(ax, "Panel (a)")  # noqa: SLF001
+    assert title.get_text() == "Panel (a)"
+    title.set_text("Panel (a) · ε = 0.1")
+    assert ax.get_title(loc="left") == "Panel (a) · ε = 0.1"
+
+
 def test_note_spectrum_combs_and_title(analysis: AnalysisResult) -> None:
     """El espectro de una nota dibuja los peines h·f y (h−½)·f del brazo elegido y del GT."""
     fig = plots.plot_note_spectrum(analysis, 0, Arm("A", 0), gt_arm=Arm("A", 12))
@@ -720,3 +790,95 @@ def test_save_all_plots_skips_plots_without_data(tmp_path: Path) -> None:
 def test_single_run_result_has_no_band_errors(func: Callable[..., Figure]) -> None:
     """Con una sola corrida la std es 0: no hay banda, pero la gráfica se dibuja igual."""
     _render(func(make_fake_result(n_runs=1, budget=15)))
+
+
+def test_describe_result_follows_the_data_not_the_textbook() -> None:
+    """Regresión: «Cómo leer esta gráfica» ya no afirma que ε-greedy queda por debajo ni que UCB1 crece
+    logarítmicamente; la frase «En este experimento…» sale de los datos (aquí UCB1 es el peor y casi lineal)."""
+    import dataclasses
+
+    res = make_fake_result()
+    budget = res.budget
+    res = dataclasses.replace(res, reward_curves=dict(res.reward_curves), regret_curves=dict(res.regret_curves))
+    res.reward_curves["ucb1"] = np.full((res.n_runs, budget), 0.30)
+    res.regret_curves["ucb1"] = np.cumsum(np.full((res.n_runs, budget), 0.25), axis=1)  # regret lineal
+    reward_text = plots.describe_result("average_reward", res)
+    assert reward_text.startswith("En este experimento")
+    assert "la más baja la de UCB1 (0.300)" in reward_text and "barrido de c" in reward_text
+    regret_text = plots.describe_result("cumulative_regret", res)
+    assert "el mayor el de UCB1" in regret_text
+    straight = regret_text.split("Crece casi en línea recta")[1].split(".")[0]
+    assert "UCB1" in straight and "O(ln T)" in regret_text
+    assert "último 10 %" in plots.describe_result("optimal_action", res)
+    assert plots.describe_result("runtime", res) == ""
+    descriptions = {spec.key: spec.description for spec in plots.COMPARISON_PLOTS}
+    assert "ε-greedy queda algo por debajo" not in descriptions["average_reward"]
+    assert "garantiza crecimiento logarítmico" not in descriptions["cumulative_regret"]
+    assert "asintótica" in descriptions["cumulative_regret"]
+
+
+def test_regret_growth_ratio_tells_straight_from_flat() -> None:
+    """La pendiente relativa del regret es ~1 para una recta y pequeña para una curva que se aplana."""
+    t = np.arange(1, 501, dtype=float)
+    assert plots.regret_growth_ratio(np.vstack([0.2 * t, 0.3 * t])) == pytest.approx(1.0, abs=0.01)
+    assert plots.regret_growth_ratio(5.0 * np.log(t)) < plots.FLAT_REGRET_RATIO
+    assert plots.regret_growth_ratio(np.zeros(500)) == 0.0
+
+
+def _drawn(fig: Figure, dpi: float = 100.0) -> Any:
+    """Dibuja ``fig`` con Agg (layout incluido) y devuelve el renderer, para medir sus textos."""
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+
+    fig.set_dpi(dpi)
+    canvas = FigureCanvasAgg(fig)
+    canvas.draw()
+    return canvas.get_renderer()
+
+
+@pytest.mark.parametrize("func", [plots.plot_arm_distribution, plots.plot_sensitivity, plots.plot_tab_heatmap,
+                                  plots.plot_lambda_effect])
+def test_figure_legends_fit_in_a_narrow_gui_canvas(func: Callable[..., Figure], res: ExperimentResult) -> None:
+    """Regresión (GUI a 1024×700, lienzo ≈ 6.5 in): ninguna leyenda de figura se sale por los lados."""
+    fig = func(res, fig=Figure(figsize=(6.4, 4.4), layout="constrained"))
+    renderer = _drawn(fig)
+    width = fig.bbox.width
+    assert fig.legends
+    for legend in fig.legends:
+        box = legend.get_window_extent(renderer)
+        assert box.x0 >= -1 and box.x1 <= width + 1, (func.__name__, box.x0, box.x1, width)
+
+
+def test_spectrogram_legend_fits_in_a_narrow_canvas(analysis: AnalysisResult) -> None:
+    """La leyenda del espectrograma (4 entradas) tampoco se corta en un lienzo estrecho."""
+    fig = plots.plot_spectrogram(analysis, fig=Figure(figsize=(6.4, 4.4), layout="constrained"))
+    renderer = _drawn(fig)
+    for legend in fig.legends:
+        box = legend.get_window_extent(renderer)
+        assert box.x0 >= -1 and box.x1 <= fig.bbox.width + 1
+
+
+def test_sweep_tick_labels_never_overlap(res: ExperimentResult) -> None:
+    """Regresión: en ejes estrechos se omiten los rótulos que se pisarían («0.00.05», «1 1.414 2»)."""
+    sweeps = [replace(sw, values=values, final_reward=np.tile(sw.final_reward[:1], (len(values), 1)))
+              for sw, values in zip(res.sweeps, ([0.01, 0.05, 0.1, 0.2, 0.3, 0.5], [0.5, 1, 2, 5, 10],
+                                                  [0.1, 0.5, 1, 1.414, 2, 4], [0.01, 0.03, 0.1, 0.3, 1]))]
+    fig = plots.plot_sensitivity(replace(res, sweeps=sweeps), fig=Figure(figsize=(6.4, 4.4), layout="constrained"))
+    renderer = _drawn(fig)
+    for ax in fig.axes:
+        labels = [t for t in ax.get_xticklabels() if t.get_text()]
+        assert len(labels) >= 2
+        boxes = sorted((t.get_window_extent(renderer) for t in labels), key=lambda b: b.x0)
+        for left, right in zip(boxes, boxes[1:]):
+            assert left.x1 <= right.x0, ax.get_xlabel()
+    # En un lienzo ancho se rotulan todos los valores de ε.
+    wide = plots.plot_sensitivity(replace(res, sweeps=sweeps), fig=Figure(figsize=(16, 9), layout="constrained"))
+    _drawn(wide)
+    assert [t.get_text() for t in wide.axes[0].get_xticklabels()] == ["0.01", "0.05", "0.1", "0.2", "0.3", "0.5"]
+
+
+def test_tab_heatmap_rotates_ground_truth_labels_when_cells_are_narrow(res: ExperimentResult) -> None:
+    """Regresión: con celdas estrechas las etiquetas X (posición real) se giran en vez de juntarse «E-0E-0D-2…»."""
+    narrow = plots.plot_tab_heatmap(res, fig=Figure(figsize=(4.0, 4.0), layout="constrained"))
+    wide = plots.plot_tab_heatmap(res, fig=Figure(figsize=(14.0, 4.0), layout="constrained"))
+    assert narrow.axes[0].get_xticklabels()[0].get_rotation() == 90
+    assert wide.axes[0].get_xticklabels()[0].get_rotation() == 0

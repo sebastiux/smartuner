@@ -226,6 +226,7 @@ def test_analyze_with_separation_uses_stem(ks_item: DatasetItem, tmp_path: Path,
     res = analyze(ks_item.mp3_path, cfg, progress=lambda f, m: fractions.append(f))
     assert calls == {"path": ks_item.mp3_path, "model": cfg.audio.demucs_model}
     assert res.path == ks_item.mp3_path and res.source_path == stem
+    assert res.separation_method == "demucs"
     assert res.ground_truth is not None and len(res.ground_truth) == 21
     assert all(b >= a for a, b in zip(fractions, fractions[1:]))
 
@@ -275,6 +276,7 @@ def test_analyze_with_hpss_separation(ks_item: DatasetItem, monkeypatch: pytest.
     plain, _ = io_audio.load_audio(ks_item.mp3_path, sr=22050)
     assert calls == [len(plain)]
     assert res.source_path == ks_item.mp3_path and res.path == ks_item.mp3_path
+    assert res.separation_method == "hpss"  # source_path no lo distingue de «sin separar»
     assert len(res.y_raw) == len(plain) and not np.allclose(res.y_raw, plain)
     assert any("HPSS" in m for m in messages)
     assert "método elegido" in caplog.text
@@ -300,8 +302,42 @@ def test_analyze_auto_without_demucs_uses_hpss(ks_item: DatasetItem, monkeypatch
     with caplog.at_level(logging.INFO, logger="src.pipeline"):
         res = analyze(ks_item.mp3_path, cfg)
     assert used == ["hpss"]
-    assert res.config.audio.separation_method == "auto"
+    assert res.config.audio.separation_method == "auto" and res.separation_method == "hpss"
     assert "automático: Demucs no está instalado" in caplog.text
+
+
+def test_analyze_without_separation_records_none(ks_item: DatasetItem) -> None:
+    """Sin «Separar bajo de mezcla» el resultado dice que no se separó (separation_method None)."""
+    res = analyze(ks_item.mp3_path, Config())
+    assert res.separation_method is None and res.source_path == ks_item.mp3_path
+
+
+@pytest.mark.parametrize("method", ["auto", "demucs"])
+def test_analyze_broken_torch_falls_back_to_hpss_only_with_auto(ks_item: DatasetItem, monkeypatch: pytest.MonkeyPatch,
+                                                                caplog: pytest.LogCaptureFixture, method: str) -> None:
+    """Demucs instalado pero torch roto (WinError 126): «auto» recurre a HPSS; «demucs» explícito falla."""
+    from src import separation
+
+    def broken(*args: object, **kwargs: object) -> Path:
+        """El runner terminó con EXIT_MISSING_DEPS."""
+        raise separation.SeparationDepsError("Demucs falló (código de salida 3): ERROR: No se pudo importar PyTorch")
+
+    used: list[str] = []
+    monkeypatch.setattr(separation, "demucs_available", lambda: True)
+    monkeypatch.setattr(separation, "separate_bass", broken)
+    monkeypatch.setattr(separation, "hpss_bass", lambda y, sr: used.append("hpss") or y)
+    cfg = Config()
+    cfg.audio.separate_bass = True
+    cfg.audio.separation_method = method
+    if method == "demucs":
+        with pytest.raises(separation.SeparationDepsError):
+            analyze(ks_item.mp3_path, cfg)
+        assert used == []
+        return
+    with caplog.at_level(logging.WARNING, logger="src.pipeline"):
+        res = analyze(ks_item.mp3_path, cfg)
+    assert used == ["hpss"] and res.separation_method == "hpss"
+    assert "se separa con HPSS" in caplog.text
 
 
 def test_analyze_demucs_requested_but_missing_fails_early(ks_item: DatasetItem, monkeypatch: pytest.MonkeyPatch) -> None:

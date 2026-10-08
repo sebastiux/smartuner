@@ -59,8 +59,10 @@ from matplotlib.figure import Figure
 from matplotlib.legend_handler import HandlerTuple
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
-from matplotlib.text import Annotation
-from matplotlib.ticker import FixedFormatter, FixedLocator, FuncFormatter, NullLocator
+from matplotlib.text import Annotation, Text
+from matplotlib.font_manager import FontProperties
+from matplotlib.textpath import TextToPath
+from matplotlib.ticker import FixedFormatter, FixedLocator, Formatter, FuncFormatter, NullLocator
 
 from src.config import (
     ALGO_COLORS,
@@ -147,6 +149,8 @@ GRID_WIDTH = 0.7
 FIGSIZE_SIMPLE: tuple[float, float] = (9.0, 5.5)
 FIGSIZE_GRID: tuple[float, float] = (11.0, 7.5)
 FIGSIZE_WIDE: tuple[float, float] = (11.0, 6.5)
+#: Alto mínimo (pulgadas) de cada fila de :func:`plot_sensitivity` para la etiqueta Y larga.
+SENSITIVITY_LONG_LABEL_MIN_IN: float = 2.6
 
 #: Fracción del hueco de cada grupo de barras que ocupan las barras (el resto es aire).
 GROUP_WIDTH = 0.72
@@ -314,6 +318,26 @@ def _titles(fig: Figure, title: str, subtitle: str | None = None) -> None:
                                   fontsize=SUBTITLE_SIZE, color=TEXT_SECONDARY))
 
 
+def drop_subtitle(fig: Figure) -> None:
+    """Quita el subtítulo que puso :func:`_titles` y las líneas que le reservaba el título.
+
+    Para lienzos bajos de la GUI (modo compacto): los ejes ganan ese espacio.
+    El título se conserva. No hace nada si la figura no tiene subtítulo.
+
+    Parameters
+    ----------
+    fig : Figure
+        Figura dibujada por una función de este módulo.
+    """
+    sup = fig._suptitle  # noqa: SLF001 - API de matplotlib sin acceso público al suptitle
+    if sup is None:
+        return
+    for artist in list(fig.artists):
+        if isinstance(artist, Annotation) and getattr(artist, "xycoords", None) is sup:
+            artist.remove()
+    sup.set_text(sup.get_text().rstrip("\n"))
+
+
 def _axis_labels(ax: Axes, xlabel: str | None = None, ylabel: str | None = None) -> None:
     """Etiquetas de los ejes en tinta secundaria."""
     if xlabel is not None:
@@ -322,21 +346,174 @@ def _axis_labels(ax: Axes, xlabel: str | None = None, ylabel: str | None = None)
         ax.set_ylabel(ylabel, color=TEXT_SECONDARY, fontsize=LABEL_SIZE)
 
 
-def _panel_title(ax: Axes, text: str) -> None:
-    """Título de un panel (en cuadrículas), alineado a la izquierda."""
-    ax.set_title(text, loc="left", fontsize=PANEL_TITLE_SIZE, color=TEXT_PRIMARY, fontweight="bold", pad=6)
+def _panel_title(ax: Axes, text: str) -> Text:
+    """Título de un panel (en cuadrículas), alineado a la izquierda; devuelve el ``Text``.
+
+    La GUI guarda la referencia para cambiar el título después (p. ej. el ε
+    vigente en la vista en vivo) sin crear un segundo título encima.
+    """
+    return ax.set_title(text, loc="left", fontsize=PANEL_TITLE_SIZE, color=TEXT_PRIMARY, fontweight="bold", pad=6)
+
+
+_TEXT_TO_PATH = TextToPath()
+
+
+def text_width_pt(text: str, size_pt: float, bold: bool = False) -> float:
+    """Ancho (puntos tipográficos, 1/72 in) de ``text`` con la fuente por defecto de matplotlib.
+
+    No necesita un *renderer* (sirve con figuras sin lienzo, en la CLI y en las
+    pruebas): mide el contorno del texto con :class:`matplotlib.textpath.TextToPath`.
+
+    Parameters
+    ----------
+    text : str
+        Texto de una línea.
+    size_pt : float
+        Tamaño de la fuente (pt).
+    bold : bool, optional
+        Negrita.
+
+    Returns
+    -------
+    float
+        Ancho en puntos.
+
+    Examples
+    --------
+    >>> text_width_pt("0.05", 10.0) > text_width_pt("1", 10.0) > 0
+    True
+    """
+    if not text:
+        return 0.0
+    prop = FontProperties(size=size_pt, weight="bold" if bold else "normal")
+    width, _height, _descent = _TEXT_TO_PATH.get_text_width_height_descent(text, prop, ismath=False)
+    return float(width)
+
+
+def legend_columns_that_fit(labels: Sequence[str], width_pt: float, fontsize: float, wanted: int,
+                            handlelength: float = 3.2, handletextpad: float = 0.8,
+                            columnspacing: float = 2.0, borderpad: float = 0.4) -> int:
+    """Mayor número de columnas (≤ ``wanted``) con el que una leyenda cabe en ``width_pt`` puntos.
+
+    Reparte las entradas como matplotlib (``np.array_split``: las primeras
+    columnas reciben una más) y suma, por columna, su texto más largo + la
+    muestra + las separaciones (en unidades del tamaño de fuente).
+
+    Parameters
+    ----------
+    labels : Sequence[str]
+        Textos de las entradas, en orden.
+    width_pt : float
+        Ancho disponible (pt), p. ej. el de la figura menos un margen.
+    fontsize : float
+        Tamaño de la fuente de la leyenda (pt).
+    wanted : int
+        Columnas pedidas (máximo).
+    handlelength, handletextpad, columnspacing, borderpad : float, optional
+        Los mismos parámetros que ``Figure.legend`` (en tamaños de fuente).
+
+    Returns
+    -------
+    int
+        Columnas (al menos 1).
+
+    Examples
+    --------
+    >>> legend_columns_that_fit(["ε-greedy"] * 4, 1000.0, 9.0, 4), legend_columns_that_fit(["ε-greedy"] * 4, 150.0, 9.0, 4)
+    (4, 1)
+    """
+    widths = np.array([text_width_pt(str(t), fontsize) for t in labels], dtype=float)
+    if widths.size == 0:
+        return 1
+    per_entry = (handlelength + handletextpad) * fontsize
+    for ncol in range(min(int(wanted), widths.size), 1, -1):
+        columns = [c for c in np.array_split(widths, ncol) if c.size]
+        total = sum(float(c.max()) + per_entry for c in columns)
+        total += (len(columns) - 1) * columnspacing * fontsize + 2.0 * borderpad * fontsize
+        if total <= width_pt:
+            return ncol
+    return 1
 
 
 def _legend(target: Axes | Figure, handles: Sequence[object], labels: Sequence[str] | None = None, **kwargs: object) -> object:
-    """Leyenda sin marco con el estilo común (en un eje o en la figura)."""
+    """Leyenda sin marco con el estilo común (en un eje o en la figura).
+
+    Una leyenda de figura «outside» con ``ncol`` reduce sus columnas si no
+    cabe en el ancho de la figura (:func:`legend_columns_that_fit`): en la GUI
+    a 1024×700 las entradas de los extremos se cortaban («-greedy», «Brazo
+    óptimo (argm»). Con menos columnas ocupa más filas y el diseño
+    *constrained* le hace sitio.
+    """
     if labels is None:
         labels = [h.get_label() for h in handles]  # type: ignore[attr-defined]
     opts: dict[str, object] = dict(frameon=False, fontsize=LEGEND_SIZE, handlelength=3.2, borderaxespad=0.6,
                                    labelcolor=TEXT_PRIMARY)
     opts.update(kwargs)
+    if isinstance(target, Figure) and "ncol" in opts and str(opts.get("loc", "")).startswith("outside"):
+        fontsize = opts["fontsize"]
+        size_pt = float(fontsize) if isinstance(fontsize, (int, float)) else FontProperties(
+            size=fontsize).get_size_in_points()
+        available = 72.0 * float(target.get_figwidth()) - 16.0   # margen de la figura a cada lado
+        opts["ncol"] = legend_columns_that_fit(
+            [str(t) for t in labels], available, size_pt, int(opts["ncol"]),  # type: ignore[call-overload]
+            handlelength=float(opts.get("handlelength", 3.2)),  # type: ignore[arg-type]
+            handletextpad=float(opts.get("handletextpad", 0.8)),  # type: ignore[arg-type]
+            columnspacing=float(opts.get("columnspacing", 2.0)))  # type: ignore[arg-type]
     legend = target.legend(list(handles), list(labels), **opts)  # type: ignore[arg-type]
     _style_legend(legend)
     return legend
+
+
+class NonOverlappingFormatter(Formatter):
+    """Rótulos de ticks fijos que omiten los que se pisarían con el anterior.
+
+    Los barridos ponen un tick en cada valor probado (ε = 0.01, 0.05, 0.1…):
+    en una escala lineal 0.01 y 0.05 quedan a pocos píxeles y se leía
+    «0.00.05»; en c, «1 1.414 2» se amontonaban. Al dibujar (cuando el
+    diseño ya fijó el tamaño de los ejes) se recorren los ticks de izquierda a
+    derecha y solo se rotula uno si empieza al menos ``gap_pt`` puntos después
+    de donde terminó el último rotulado. El tick sigue marcado; el valor
+    omitido aparece en el título del panel («mejor: …») o en la etiqueta
+    «actual: …» cuando es relevante.
+
+    Parameters
+    ----------
+    fmt : Callable[[float], str], optional
+        Texto de cada valor (por defecto :func:`_fmt_value`).
+    gap_pt : float, optional
+        Separación mínima entre rótulos (pt).
+    """
+
+    def __init__(self, fmt: Callable[[float], str] | None = None, gap_pt: float = 4.0) -> None:
+        self.fmt = fmt or _fmt_value
+        self.gap_pt = float(gap_pt)
+
+    def __call__(self, x: float, pos: int | None = None) -> str:
+        """Texto de un tick aislado (sin comprobar solapes)."""
+        return self.fmt(x)
+
+    def format_ticks(self, values: Sequence[float]) -> list[str]:
+        """Textos de todos los ticks: "" para los que se solaparían con el anterior rotulado."""
+        texts = [self.fmt(v) for v in values]
+        axis = getattr(self, "axis", None)
+        axes = getattr(axis, "axes", None)
+        if axes is None or len(values) < 2 or axis.axis_name != "x":  # type: ignore[union-attr]
+            return texts
+        ticks = axis.get_major_ticks()  # type: ignore[union-attr]
+        size = float(ticks[0].label1.get_fontsize()) if ticks else LABEL_SIZE
+        to_pt = 72.0 / float(axes.figure.dpi)
+        x_px = axes.transData.transform(np.column_stack([np.asarray(values, dtype=float),
+                                                         np.zeros(len(values))]))[:, 0]
+        out: list[str] = []
+        last_right: float | None = None
+        for x, text in zip(x_px * to_pt, texts):
+            half = 0.5 * text_width_pt(text, size)
+            if last_right is not None and x - half < last_right + self.gap_pt:
+                out.append("")
+                continue
+            out.append(text)
+            last_right = x + half
+        return out
 
 
 def _percent_axis(ax: Axes, axis: str = "y", top: float = 100.0) -> None:
@@ -583,8 +760,11 @@ def plot_average_reward(res: ExperimentResult, fig: Figure | None = None) -> Fig
     -----
     Es la gráfica clásica de Sutton & Barto (fig. 2.2): un buen algoritmo sube
     rápido (explora poco tiempo) y se estabiliza alto (explota el mejor
-    brazo). La asíntota de ε-greedy queda por debajo de μ* porque sigue
-    explorando una fracción ε de los pulls.
+    brazo). En teoría la asíntota de ε-greedy queda por debajo de μ* porque
+    sigue explorando una fracción ε de los pulls; en la práctica el orden
+    depende de los hiperparámetros y de las brechas Δ (con la configuración
+    por defecto y T = 500, UCB1 suele quedar el último: ver
+    :func:`describe_result`, que explica lo que muestra cada experimento).
     """
     fig = _prepare_figure(fig, FIGSIZE_SIMPLE)
     msg = missing_data_message("average_reward", res)
@@ -624,8 +804,11 @@ def plot_cumulative_regret(res: ExperimentResult, fig: Figure | None = None) -> 
     -----
     El pseudo-regret mide lo que se PIERDE por no jugar siempre el brazo
     óptimo. Si la curva se aplana, el agente dejó de equivocarse; si crece
-    como una recta (ε-greedy con ε fijo), el regret es lineal en T; UCB1
-    garantiza un crecimiento logarítmico.
+    como una recta, sigue explorando a un ritmo constante (ε-greedy con ε
+    fijo lo hace siempre). UCB1 garantiza un regret O(Σₐ ln T / Δₐ), pero es
+    una cota ASINTÓTICA: con brechas Δ pequeñas (posiciones del mismo pitch)
+    y T de unos cientos de pulls, el bono c·√(ln t / n) domina y la curva
+    puede verse casi recta (ver :func:`describe_result`).
     """
     fig = _prepare_figure(fig, FIGSIZE_SIMPLE)
     msg = missing_data_message("cumulative_regret", res)
@@ -793,7 +976,7 @@ def plot_arm_distribution(res: ExperimentResult, fig: Figure | None = None) -> F
     optimal = {int(a) for a in np.atleast_1d(ex.optimal_arms)}
     labels = [f"{ex.arm_labels[a]}\nμ={_fmt_mu(mu[a])}" for a in shown]
     if rest.size:
-        labels.append(f"Otros\n({rest.size} brazos)")
+        labels.append(f"Otros\n{rest.size} brazos")  # sin paréntesis: no se junta con el μ vecino a 1024 px
     algs = _ordered_algorithms(res, ex.counts)
     x = np.arange(len(labels), dtype=float)
     offsets, width = _bar_offsets(len(algs), _bar_limit(fig, len(labels) + 0.2))
@@ -973,7 +1156,7 @@ def _value_axis(ax: Axes, values: np.ndarray, log: bool) -> None:
         else:
             ax.set_xscale("log")
     ax.xaxis.set_major_locator(FixedLocator(values.tolist()))
-    ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _pos: _fmt_value(v)))
+    ax.xaxis.set_major_formatter(NonOverlappingFormatter())  # sin «0.00.05» ni «1 1.414 2» en ejes estrechos
     ax.xaxis.set_minor_locator(NullLocator())
 
 
@@ -1028,7 +1211,12 @@ def plot_sensitivity(res: ExperimentResult, fig: Figure | None = None) -> Figure
     order = {p: i for i, p in enumerate(_SWEEP_INFO)}
     sweeps = sorted(res.sweeps, key=lambda s: order.get(s.param, len(order)))
     axes = _panel_axes(fig, len(sweeps))
-    _rows, cols = _grid_shape(len(sweeps))
+    rows, cols = _grid_shape(len(sweeps))
+    # En lienzos bajos (la GUI a 1360×880 deja ≈ 1.7 in por fila) la etiqueta larga sería más alta
+    # que su panel y se montaría sobre el subtítulo y el panel de abajo: se usa la forma corta
+    # (el subtítulo ya define r).
+    row_height_in = fig.get_size_inches()[1] / max(rows, 1)
+    ylabel = "Recompensa media final r" if row_height_in >= SENSITIVITY_LONG_LABEL_MIN_IN else "r final"
     algs_seen: list[str] = []
     n_runs = 0
     for k, (ax, sw) in enumerate(zip(axes, sweeps)):
@@ -1054,7 +1242,7 @@ def plot_sensitivity(res: ExperimentResult, fig: Figure | None = None) -> Figure
         _panel_title(ax, f"{symbol} — {_algo_label(alg)} · mejor: {_fmt_value(values[best])}")
         _axis_labels(ax, xlabel=xlabel)
         if k % cols == 0:
-            _axis_labels(ax, ylabel="Recompensa media final r")
+            _axis_labels(ax, ylabel=ylabel)
     rank = {a: i for i, a in enumerate(ALGORITHMS)}
     handles: list[object] = [_algo_handle(a) for a in sorted(algs_seen, key=lambda a: rank.get(a, len(rank)))]
     handles.append(Line2D([], [], color=TEXT_MUTED, linewidth=1.3, label="Valor actual de la configuración"))
@@ -1498,9 +1686,14 @@ def plot_tab_heatmap(res: ExperimentResult, fig: Figure | None = None,
     ax.set_ylim(len(rows), 0)  # primera fila arriba
 
     # Texto dentro de cada celda: la posición predicha (o solo el traste si no cabe).
+    # Ancho de la celda: el de la figura menos los nombres de las filas (izquierda),
+    # la columna «Posición exacta» (derecha) y los márgenes.
     fig_w = fig.get_size_inches()[0]
-    cell_pt = 72.0 * fig_w * 0.80 / max(n_gt, 1)
-    if cell_pt >= 24:
+    row_names_pt = max((text_width_pt(label, LABEL_SIZE - 0.5) for label, _ in rows), default=0.0)
+    axes_pt = max(72.0 * fig_w - row_names_pt - 70.0, 72.0 * fig_w * 0.4)
+    cell_pt = axes_pt / max(n_gt, 1)
+    widest_cell = max((text_width_pt(t, 7.5) for row in texts for t in row), default=0.0)
+    if cell_pt >= widest_cell + 5.0:
         fontsize, short = 7.5, False
     elif cell_pt >= 13:
         fontsize, short = 7.0, True
@@ -1523,7 +1716,10 @@ def plot_tab_heatmap(res: ExperimentResult, fig: Figure | None = None,
                 color=TEXT_PRIMARY)
 
     ax.set_yticks(np.arange(len(rows)) + 0.5, [label for label, _ in rows])
-    rotate = n_gt > 24
+    # Las etiquetas X (la posición REAL) se giran si en horizontal no caben en su celda:
+    # a 1024×700 con 20 notas se leía «E-0E-0D-2E-0…».
+    widest_x = max((text_width_pt(n.label, 8.5) for n in gt), default=0.0)
+    rotate = n_gt > 24 or widest_x + 3.0 > cell_pt
     ax.set_xticks(np.arange(n_gt) + 0.5, [n.label for n in gt], rotation=90 if rotate else 0)
     apply_style(fig, grid=None)
     for side in ("left", "bottom"):
@@ -1567,6 +1763,25 @@ def _cached_display_cqt(analysis: AnalysisResult) -> Spectrum:
     spec = compute_spectrum(analysis.y_spectral, analysis.sr, cfg, hop_length=analysis.spectrum.hop_length)
     _DISPLAY_CQT_CACHE[:] = [(analysis.y_spectral, key, spec)]
     return spec
+
+
+def prepare_display_spectrum(analysis: AnalysisResult) -> None:
+    """Precalcula la CQT con la que se DIBUJA el espectrograma si la recompensa usa la STFT.
+
+    Las figuras de audio (:func:`plot_spectrogram`, :func:`plot_audio_overview`)
+    siempre muestran una CQT; si ``analysis.spectrum`` es una STFT la calculan
+    la primera vez que se dibujan (≈ 6 s para una canción de 6 min). La GUI
+    llama a esta función en el HILO TRABAJADOR, al final del análisis, para que
+    la ventana no se congele al mostrar el resultado. Sin efecto si el
+    espectro ya es una CQT o si la CQT de visualización ya está en la caché.
+
+    Parameters
+    ----------
+    analysis : AnalysisResult
+        Análisis recién calculado.
+    """
+    if analysis.spectrum.kind != "cqt":
+        _cached_display_cqt(analysis)
 
 
 def _display_cqt(analysis: AnalysisResult) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -1666,9 +1881,11 @@ def _draw_segments(ax: Axes, analysis: AnalysisResult, selected: int | None, num
         top = ax.get_xaxis_transform()
         for pos, seg in enumerate(kept):
             chosen = is_selected and pos == selected
+            # clip_on: al hacer zoom en la GUI, los números de los segmentos fuera de la vista
+            # no deben dibujarse a los lados de los ejes.
             ax.text((seg.start_s + seg.end_s) / 2, 0.97, str(pos), transform=top, ha="center", va="top",
                     fontsize=7.5 if chosen else 7, fontweight="bold" if chosen else "normal",
-                    color=TEXT_PRIMARY if chosen else TEXT_SECONDARY, zorder=6)
+                    color=TEXT_PRIMARY if chosen else TEXT_SECONDARY, zorder=6, clip_on=True)
     if is_selected:
         # Solo un marco (sin relleno): el gris de fondo está reservado a los segmentos descartados.
         seg = kept[selected]  # type: ignore[index]
@@ -1698,8 +1915,10 @@ def _audio_subtitle(analysis: AnalysisResult) -> str:
     shown = "CQT de la señal sin filtrar"
     if analysis.spectrum.kind != "cqt":
         shown += f" (la recompensa usa la {analysis.spectrum.kind.upper()})"
-    return (f"{name} · {analysis.duration_s:.1f} s · {len(analysis.onsets_s)} onsets · "
-            f"{kept} segmentos conservados, {discarded} descartados · {shown}")
+    n_onsets = len(analysis.onsets_s)
+    return (f"{name} · {analysis.duration_s:.1f} s · {n_onsets} onset{'s' if n_onsets != 1 else ''} · "
+            f"{kept} segmento{'s' if kept != 1 else ''} conservado{'s' if kept != 1 else ''}, "
+            f"{discarded} descartado{'s' if discarded != 1 else ''} · {shown}")
 
 
 def _selected_text(analysis: AnalysisResult, selected: int | None) -> str | None:
@@ -1763,7 +1982,23 @@ def plot_spectrogram(analysis: AnalysisResult, fig: Figure | None = None, select
     return fig
 
 
-def plot_audio_overview(analysis: AnalysisResult, fig: Figure | None = None, selected: int | None = None) -> Figure:
+#: Marcas del eje de notas en la versión compacta de :func:`plot_audio_overview`
+#: (una por octava: con el eje bajo, las siete de :data:`NOTE_TICKS` se pisan).
+COMPACT_NOTE_TICKS: tuple[str, ...] = ("E1", "G2", "G3", "G4", "G5")
+
+
+def _thin_note_ticks(ax: Axes, keep: Sequence[str] = COMPACT_NOTE_TICKS) -> None:
+    """Deja en el eje de notas (:func:`_note_axis`) solo las marcas cuyos nombres están en ``keep``."""
+    ticks = [(name, hz) for name, hz in NOTE_TICKS if name in keep]
+    lo, hi = ax.get_ylim()
+    ticks = [(name, hz) for name, hz in ticks if lo <= hz <= hi]
+    if ticks:
+        ax.yaxis.set_major_locator(FixedLocator([hz for _n, hz in ticks]))
+        ax.yaxis.set_major_formatter(FixedFormatter([f"{name} · {hz:.0f}" for name, hz in ticks]))
+
+
+def plot_audio_overview(analysis: AnalysisResult, fig: Figure | None = None, selected: int | None = None,
+                        compact: bool = False) -> Figure:
     """Forma de onda (arriba) + espectrograma con onsets y f0 (abajo), ejes x compartidos.
     Es la figura de la pestaña Audio.
 
@@ -1775,6 +2010,12 @@ def plot_audio_overview(analysis: AnalysisResult, fig: Figure | None = None, sel
         Figura a reutilizar.
     selected : int, optional
         Posición (entre los segmentos conservados) a resaltar en ambos paneles.
+    compact : bool, optional
+        Versión para lienzos bajos (≲ 360 px, ventanas de 1024×700): sin
+        subtítulo (sus datos están en el panel de información de la GUI),
+        etiquetas Y cortas («Amplitud», «Hz (log)»), una marca de nota por
+        octava y «dB» en la barra de color. Con las etiquetas largas, más altas
+        que sus ejes, *constrained layout* colapsaría los paneles.
 
     Returns
     -------
@@ -1807,17 +2048,21 @@ def plot_audio_overview(analysis: AnalysisResult, fig: Figure | None = None, sel
     peak = max(float(np.max(np.abs(y))) if y.size else 1.0, 1e-6)
     ax_wave.set_ylim(-1.08 * peak, 1.08 * peak)
     _draw_segments(ax_wave, analysis, selected, numbers=True)
-    _axis_labels(ax_wave, ylabel="Amplitud\n(normalizada)")
+    _axis_labels(ax_wave, ylabel="Amplitud" if compact else "Amplitud\n(normalizada)")
     ax_wave.tick_params(axis="x", labelbottom=False)
 
     mesh = _draw_spectrogram(ax_spec, analysis)
     _draw_segments(ax_spec, analysis, selected, numbers=False)
     ax_spec.set_xlim(0, analysis.duration_s)
-    _axis_labels(ax_spec, "Tiempo (s)", "Frecuencia (Hz, escala log)")
+    _axis_labels(ax_spec, "Tiempo (s)", "Hz (log)" if compact else "Frecuencia (Hz, escala log)")
     _colorbar(fig, mesh, cax=cax)
+    if compact:
+        _thin_note_ticks(ax_spec)
+        cax.set_ylabel("dB", color=TEXT_SECONDARY, fontsize=LABEL_SIZE - 1)
 
     sel = _selected_text(analysis, selected)
-    _titles(fig, "Forma de onda y espectrograma" + (f" · {sel}" if sel else ""), _audio_subtitle(analysis))
+    _titles(fig, "Forma de onda y espectrograma" + (f" · {sel}" if sel else ""),
+            None if compact else _audio_subtitle(analysis))
     _legend(fig, _audio_handles(sel is not None), loc="outside lower center", ncol=4, handlelength=2.0)
     apply_style(fig, grid=None)
     ax_wave.grid(True, axis="y", color=GRID, linewidth=GRID_WIDTH)
@@ -1982,13 +2227,18 @@ COMPARISON_PLOTS: list[PlotSpec] = [
         "average_reward", "Recompensa media por pull", plot_average_reward,
         "Recompensa obtenida en cada pull t, promediada sobre todos los segmentos y corridas (banda = ±1 std "
         "entre corridas). Cuanto antes sube y más alto se estabiliza la curva, mejor equilibra el algoritmo "
-        "exploración y explotación; ε-greedy queda algo por debajo porque sigue explorando una fracción ε.",
+        "exploración y explotación. Lo que explora de más se ve como una curva más baja: ε-greedy, en teoría, "
+        "por la fracción ε de pulls al azar; UCB1, si su bono c·√(ln t/n) es grande frente a las brechas Δ "
+        "entre brazos. Qué algoritmo queda por debajo depende de los hiperparámetros (gráfica de sensibilidad).",
     ),
     PlotSpec(
         "cumulative_regret", "Regret acumulado", plot_cumulative_regret,
         "Suma de lo perdido por no jugar el brazo óptimo, Σ(μ* − μ_a), promediada sobre segmentos. Una curva "
-        "que se aplana indica que el agente ya encontró el mejor brazo; crecer como una recta (regret lineal) "
-        "es típico de ε fijo, mientras que UCB1 garantiza crecimiento logarítmico.",
+        "que se aplana indica que el agente ya encontró el mejor brazo; una que crece como una recta, que sigue "
+        "explorando a ritmo constante (regret lineal; ε-greedy con ε fijo lo hace siempre). En teoría UCB1 "
+        "tiene regret O(Σ ln T/Δₐ), pero es una cota asintótica: con brechas Δ pequeñas entre posiciones del "
+        "mismo pitch y T de unos cientos de pulls, el bono c·√(ln t/n) domina y UCB1 explora casi todo el "
+        "presupuesto. Compáralo con el barrido de c en la gráfica de sensibilidad.",
     ),
     PlotSpec(
         "optimal_action", "Selección del brazo óptimo", plot_optimal_action,
@@ -2042,6 +2292,125 @@ COMPARISON_PLOTS: list[PlotSpec] = [
         "falló el pitch o la nota no se detectó. Errores comunes a todas las filas apuntan a la recompensa o a pYIN.",
     ),
 ]
+
+
+#: Pendiente del regret en el último 20 % de los pulls, relativa a la pendiente media
+#: R(T)/T, a partir de la cual se dice que la curva crece «casi en línea recta».
+#: (Referencias: regret lineal → 1; R(t) = a·ln t con T = 500 → ≈ 0.18.)
+LINEAR_REGRET_RATIO: float = 0.6
+
+#: Por debajo de esta pendiente relativa se dice que la curva de regret «se aplana».
+FLAT_REGRET_RATIO: float = 0.35
+
+
+def regret_growth_ratio(curve: np.ndarray) -> float:
+    """Pendiente del regret acumulado al final, relativa a su pendiente media.
+
+    ``ratio = [R(T) − R(0.8·T)] / (0.2·T)  ÷  R(T) / T``: vale 1 si el regret
+    crece como una recta (el agente sigue perdiendo lo mismo en cada pull) y
+    se acerca a 0 si la curva se aplana (dejó de equivocarse).
+
+    Parameters
+    ----------
+    curve : np.ndarray
+        Regret acumulado, ``(T,)`` o ``(corridas, T)`` (se promedia).
+
+    Returns
+    -------
+    float
+        Pendiente relativa (0 si el regret final es 0).
+
+    Examples
+    --------
+    >>> t = np.arange(1, 501)
+    >>> round(regret_growth_ratio(0.3 * t), 2), round(regret_growth_ratio(np.log(t)), 2)
+    (1.0, 0.18)
+    """
+    mean = np.asarray(curve, dtype=float)
+    if mean.ndim > 1:
+        mean = mean.mean(axis=0)
+    n = mean.size
+    if n < 5 or mean[-1] <= 0:
+        return 0.0
+    k = int(round(0.8 * n)) - 1
+    end_slope = (mean[-1] - mean[k]) / (n - 1 - k)
+    return float(end_slope / (mean[-1] / n))
+
+
+def describe_result(key: str, res: ExperimentResult) -> str:
+    """Frase «En este experimento…» con lo que muestran los DATOS de una gráfica comparativa.
+
+    Las descripciones de :data:`COMPARISON_PLOTS` explican la teoría; esta
+    función dice qué pasó en el experimento proyectado (qué algoritmo quedó
+    arriba o abajo y si el regret se aplana), para que el texto nunca
+    contradiga a la gráfica que lo acompaña.
+
+    Parameters
+    ----------
+    key : str
+        Clave de la gráfica (``"average_reward"``, ``"cumulative_regret"`` u
+        ``"optimal_action"``; las demás devuelven "").
+    res : ExperimentResult
+        Resultado del experimento.
+
+    Returns
+    -------
+    str
+        Una o dos frases en español, o "" si no hay nada que añadir.
+    """
+    algs = [a for a in res.algorithms if a in res.reward_curves]
+    if not algs:
+        return ""
+    rows = {str(r["algorithm"]): r for r in res.summary_rows()}
+    ucb_c = float(res.config.agent.ucb_c)
+
+    def ranked(column: str, reverse: bool) -> list[str]:
+        values = [a for a in algs if rows.get(a, {}).get(column) is not None]
+        return sorted(values, key=lambda a: float(rows[a][column]), reverse=reverse)  # type: ignore[arg-type]
+
+    if key == "average_reward":
+        order = ranked("mean_reward", reverse=True)
+        if len(order) < 2:
+            return ""
+        best, worst = order[0], order[-1]
+        text = (f"En este experimento la recompensa media más alta es la de {_algo_label(best)} "
+                f"({float(rows[best]['mean_reward']):.3f}) y la más baja la de {_algo_label(worst)} "
+                f"({float(rows[worst]['mean_reward']):.3f}).")
+        if worst == "ucb1":
+            text += (f" UCB1 queda por debajo porque, con c = {ucb_c:g} y brechas Δ pequeñas entre posiciones "
+                     "del mismo pitch, su bono de exploración pesa más que las diferencias de Q y sigue "
+                     "probando brazos peores durante casi todo el presupuesto (mira el barrido de c).")
+        elif worst == "egreedy":
+            text += (f" ε-greedy queda por debajo porque sigue eligiendo al azar una fracción "
+                     f"ε = {float(res.config.agent.epsilon):g} de los pulls.")
+        return text
+    if key == "cumulative_regret":
+        order = ranked("final_regret", reverse=False)
+        if len(order) < 2:
+            return ""
+        best, worst = order[0], order[-1]
+        text = (f"En este experimento el menor regret final es el de {_algo_label(best)} "
+                f"({float(rows[best]['final_regret']):.1f} por segmento) y el mayor el de {_algo_label(worst)} "
+                f"({float(rows[worst]['final_regret']):.1f}).")
+        straight = [a for a in algs if regret_growth_ratio(res.regret_curves[a]) >= LINEAR_REGRET_RATIO]
+        flat = [a for a in algs if regret_growth_ratio(res.regret_curves[a]) <= FLAT_REGRET_RATIO]
+        if straight:
+            text += f" Crece casi en línea recta (sigue explorando): {', '.join(_algo_label(a) for a in straight)}."
+        if flat:
+            text += f" Se aplana (ya se fijó en un brazo): {', '.join(_algo_label(a) for a in flat)}."
+        if "ucb1" in straight:
+            text += (f" Para UCB1 eso no contradice su cota O(ln T): con T = {res.budget} y c = {ucb_c:g} el "
+                     "bono c·√(ln t/n) aún domina; con una c menor el regret se aplana antes.")
+        return text
+    if key == "optimal_action":
+        order = ranked("optimal_pct", reverse=True)
+        if len(order) < 2:
+            return ""
+        best, worst = order[0], order[-1]
+        return (f"En este experimento, en el último 10 % de los pulls, {_algo_label(best)} juega el brazo óptimo "
+                f"un {float(rows[best]['optimal_pct']):.0f} % de las veces y {_algo_label(worst)} un "
+                f"{float(rows[worst]['optimal_pct']):.0f} %.")
+    return ""
 
 
 def save_figure(fig: Figure, out_dir: str | Path, name: str, formats: tuple[str, ...] = ("png", "pdf"), dpi: int = 150) -> list[Path]:

@@ -14,14 +14,26 @@ librosa decodificaba MP3 a través de *audioread*, que a su vez llamaba a
 ffmpeg. librosa ≥ 1.0 eliminó ese backend, así que aquí se invoca ffmpeg por
 subproceso, pidiéndole que haga todo el trabajo de una vez::
 
-    ffmpeg -i entrada.mp3 -f f32le -ac 1 -ar 22050 -
-           │              │       │     │        └─ escribe a stdout
-           │              │       │     └─ remuestrea a 22 050 Hz
-           │              │       └─ mezcla a mono (promedio de canales); -ac 2 = estéreo
+    ffmpeg -i entrada.mp3 -f f32le -ac 1 -rematrix_maxval 1.0 -ar 22050 -
+           │              │       │     │                   │        └─ escribe a stdout
+           │              │       │     │                   └─ remuestrea a 22 050 Hz
+           │              │       │     └─ normaliza la matriz de mezcla (ver abajo)
+           │              │       └─ mezcla a mono; -ac 2 = estéreo
            │              └─ muestras float32 little-endian "crudas"
            └─ cualquier formato que ffmpeg entienda (MP3, WAV, FLAC, OGG, M4A...)
 
 y los bytes de stdout se reinterpretan como ``np.float32``.
+
+¿Por qué ``-rematrix_maxval 1.0``? Para pasar de estéreo a mono, libswresample
+multiplica cada canal por 1/√2 y, con salida en coma flotante, NO normaliza:
+y = (L + R)/√2 ≈ 0.707·(L + R). Con un bajo centrado (L ≈ R, lo típico en una
+pista de bajo aislado o en un stem de Demucs) eso sube el nivel +3 dB y la
+señal llega a ±1.41: la pestaña Audio la reproduciría saturada y el umbral
+absoluto de silencio dependería del decodificador. Con la matriz normalizada a
+1, la mezcla es el PROMEDIO exacto y = (L + R)/2, igual que el respaldo con
+soundfile. (Al revés, un archivo mono pedido con ``-ac 2`` sale a 0.707 por
+canal, −3 dB; no afecta a Demucs, que normaliza la mezcla por su desviación
+estándar.)
 
 ¿De dónde sale ffmpeg? (sin instalación manual)
 -----------------------------------------------
@@ -364,6 +376,9 @@ def _decode_with_ffmpeg(ffmpeg: str, path: Path, sr: int, channels: int) -> np.n
         "-i", str(path),
         "-f", "f32le", "-acodec", "pcm_f32le",  # float32 crudo
         "-ac", str(int(channels)),              # 1 = mezcla a mono; 2 = estéreo
+        # Sin esto, estéreo → mono da (L + R)/√2 (hasta +3 dB por encima de
+        # ±1 con un bajo centrado); con la matriz normalizada es (L + R)/2.
+        "-rematrix_maxval", "1.0",
         "-ar", str(int(sr)),                    # remuestreo
         "-",                                    # salida por stdout
     ]
@@ -446,7 +461,8 @@ def load_audio(path: str | Path, sr: int = 22050, channels: int = 1) -> tuple[np
         Frecuencia de muestreo de salida en Hz (por defecto 22 050).
     channels : int, optional
         1 = mono (promedio de los canales; por defecto) o 2 = estéreo (lo que
-        necesita Demucs). Un archivo mono pedido en estéreo se duplica.
+        necesita Demucs). Un archivo mono pedido en estéreo se duplica (con
+        ffmpeg, a −3 dB por canal: 0.707·x en cada lado).
 
     Returns
     -------

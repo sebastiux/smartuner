@@ -47,12 +47,23 @@ disponible, :meth:`TabPlayback.play` exporta el audio preparado a un WAV (y
 la tablatura a ``.mid``) en ``cache/playback/`` y los abre con el
 reproductor del sistema (``os.startfile`` en Windows, ``open`` en macOS,
 ``xdg-open`` en Linux). En ese modo el cursor NO se sincroniza (no se sabe
-qué está sonando en otro programa) y se avisa con ``on_message``.
+qué está sonando en otro programa) y se avisa con ``on_message``. Cada
+escucha desde otro instante escribe un WAV nuevo; los anteriores se borran
+(y todos al cerrar), para que la carpeta no crezca sin límite.
+
+Tarjetas que no aceptan 22 050 Hz
+---------------------------------
+Algunos controladores (WASAPI en Windows) solo aceptan la frecuencia nativa
+del dispositivo. La primera reproducción lo descubre (se remuestrea esa vez)
+y :class:`SoundDeviceOutput` lo recuerda en ``forced_sr``; desde entonces el
+audio se prepara directamente a esa frecuencia EN SEGUNDO PLANO, de modo que
+reanudar, saltar o cambiar de modo no congela la ventana.
 
 Hilos
 -----
 Todos los métodos públicos se llaman desde el hilo de la GUI. Solo la
-síntesis corre en otro hilo (la función que se pasa a ``run_in_background``)
+síntesis (y el remuestreo, si la tarjeta lo exige) corre en otro hilo (la
+función que se pasa a ``run_in_background``)
 y no toca el estado del objeto: devuelve su resultado y ``on_done`` lo aplica
 en el hilo de la GUI.
 """
@@ -192,6 +203,19 @@ class SoundDeviceOutput:
     ----------
     error : str
         Motivo por el que no se puede reproducir ("" si se puede).
+    forced_sr : int | None
+        Frecuencia (Hz) a la que hay que reproducir porque el dispositivo
+        rechazó otra (p. ej. WASAPI en Windows solo acepta su frecuencia
+        nativa, 44 100/48 000 Hz). None mientras no haya habido rechazos.
+
+    Notes
+    -----
+    Remuestrear una canción de 6 min tarda ~0.5–1 s y :meth:`play` se llama
+    en el hilo de la GUI. Por eso, tras el PRIMER rechazo se recuerda la
+    frecuencia aceptada (:attr:`forced_sr`): las siguientes llamadas van
+    directas a ella, sin el intento fallido; :class:`TabPlayback` prepara su
+    audio ya a esa frecuencia en segundo plano, y aquí se guarda el último
+    remuestreo de una misma señal (la pista completa de la pestaña Audio).
     """
 
     def __init__(self, module: Any | None = None) -> None:
@@ -200,6 +224,9 @@ class SoundDeviceOutput:
         else:
             self._sd, self.error = module, ""
         self._stream: Any = None
+        self.forced_sr: int | None = None
+        # Último remuestreo: (señal original, sr de origen, sr de destino, señal remuestreada).
+        self._resampled: tuple[np.ndarray, int, int, np.ndarray] | None = None
 
     @property
     def available(self) -> bool:
@@ -233,8 +260,24 @@ class SoundDeviceOutput:
             return 0.0
         return value if math.isfinite(value) and value > 0 else 0.0
 
+    def _resampled_copy(self, y: np.ndarray, sr_from: int, sr_to: int) -> np.ndarray:
+        """``y`` remuestreada de ``sr_from`` a ``sr_to`` Hz y recortada a [-1, 1].
+
+        Reutiliza el último resultado si ``y`` es el MISMO objeto (p. ej. «▶ Todo»
+        de la pestaña Audio pasa siempre ``analysis.y_raw``).
+        """
+        cached = self._resampled
+        if cached is not None and cached[0] is y and cached[1:3] == (sr_from, sr_to):
+            return cached[3]
+        out = np.clip(_resample(np.asarray(y, dtype=np.float32), sr_from, sr_to), -1.0, 1.0)
+        self._resampled = (y, sr_from, sr_to, out)
+        return out
+
     def play(self, y: np.ndarray, sr: int) -> float:
         """Reproduce ``y`` sin bloquear (detiene antes cualquier reproducción previa).
+
+        Las muestras se recortan a [-1, 1] (un valor fuera de rango saturaría
+        PortAudio o el mezclador del sistema con un chasquido).
 
         Parameters
         ----------
@@ -255,21 +298,32 @@ class SoundDeviceOutput:
         """
         if self._sd is None:
             raise RuntimeError(self.error)
-        data = np.ascontiguousarray(y, dtype=np.float32)
+        sr = int(sr)
         self._sd.stop()
-        try:
-            self._sd.play(data, int(sr))
-        except Exception as exc:  # noqa: BLE001 - se reintenta a la frecuencia del dispositivo
-            # Algunos controladores (p. ej. WASAPI en Windows) solo aceptan la frecuencia
-            # nativa del dispositivo (44 100 / 48 000 Hz): se remuestrea y se reintenta.
-            device_sr = self._device_samplerate()
-            if device_sr is None or device_sr == int(sr):
-                raise RuntimeError(f"No se pudo reproducir el audio: {exc}") from exc
-            logger.info("La salida de audio no acepta %d Hz (%s); se remuestrea a %d Hz.", sr, exc, device_sr)
+        if self.forced_sr is not None and self.forced_sr != sr:
+            # Ya se sabe que el dispositivo no acepta ``sr``: directo a la frecuencia que sí acepta.
+            data = self._resampled_copy(y, sr, self.forced_sr)
             try:
-                self._sd.play(_resample(data, int(sr), device_sr), device_sr)
-            except Exception as exc2:  # noqa: BLE001
-                raise RuntimeError(f"No se pudo reproducir el audio: {exc2}") from exc2
+                self._sd.play(data, self.forced_sr)
+            except Exception as exc:  # noqa: BLE001
+                raise RuntimeError(f"No se pudo reproducir el audio: {exc}") from exc
+        else:
+            data = np.clip(np.asarray(y, dtype=np.float32), -1.0, 1.0)  # copia contigua: no toca ``y``
+            try:
+                self._sd.play(data, sr)
+            except Exception as exc:  # noqa: BLE001 - se reintenta a la frecuencia del dispositivo
+                # Algunos controladores (p. ej. WASAPI en Windows) solo aceptan la frecuencia
+                # nativa del dispositivo (44 100 / 48 000 Hz): se remuestrea y se reintenta.
+                device_sr = self._device_samplerate()
+                if device_sr is None or device_sr == sr:
+                    raise RuntimeError(f"No se pudo reproducir el audio: {exc}") from exc
+                logger.info("La salida de audio no acepta %d Hz (%s); se remuestrea a %d Hz y se recordará "
+                            "para las próximas reproducciones.", sr, exc, device_sr)
+                try:
+                    self._sd.play(self._resampled_copy(y, sr, device_sr), device_sr)
+                except Exception as exc2:  # noqa: BLE001
+                    raise RuntimeError(f"No se pudo reproducir el audio: {exc2}") from exc2
+                self.forced_sr = device_sr
         self._stream = self._current_stream()
         return self._latency_of(self._stream)
 
@@ -370,11 +424,29 @@ def _safe_stem(name: str) -> str:
 
 @dataclass
 class _Prepared:
-    """Resultado de la tarea en segundo plano (se aplica en el hilo de la GUI)."""
+    """Resultado de la tarea en segundo plano (se aplica en el hilo de la GUI).
+
+    Attributes
+    ----------
+    synth : np.ndarray | None
+        Síntesis a la frecuencia del análisis (para la caché).
+    audio : np.ndarray | None
+        Audio listo para el modo pedido, a ``sr`` Hz.
+    error : str
+        Motivo del fallo ("" si fue bien).
+    sr : int
+        Frecuencia (Hz) de ``audio``: la del análisis o la que exige la tarjeta.
+    synth_out, original_out : np.ndarray | None
+        Síntesis y original remuestreados a ``sr`` (si hubo que remuestrear),
+        para no repetirlo al cambiar de modo.
+    """
 
     synth: np.ndarray | None
     audio: np.ndarray | None
     error: str = ""
+    sr: int = 0
+    synth_out: np.ndarray | None = None
+    original_out: np.ndarray | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -499,6 +571,12 @@ class TabPlayback:
 
         self._cache: OrderedDict[tuple[Any, ...], np.ndarray] = OrderedDict()
         self._audio: np.ndarray | None = None   # audio listo para el modo actual
+        self._audio_sr: int = self.sr           # frecuencia (Hz) de self._audio
+        # Remuestreos para una tarjeta que no acepta self.sr (ver _output_sr):
+        # (clave de la síntesis, sr, señal) y (original, sr, señal).
+        self._synth_out: tuple[tuple[Any, ...], int, np.ndarray] | None = None
+        self._original_out: tuple[np.ndarray, int, np.ndarray] | None = None
+        self._exported: list[Path] = []         # WAV del modo sin sounddevice (se borran los viejos)
         self._state = "stopped"
         self._generation = 0                    # cambia con la fuente, el modo o el método
         self._in_flight = False                 # hay una síntesis en segundo plano
@@ -577,7 +655,7 @@ class TabPlayback:
     def duration_s(self) -> float:
         """Duración (s) del audio que se reproduce (estimada si aún no se sintetizó)."""
         if self._audio is not None:
-            return self._audio.shape[0] / float(self.sr)
+            return self._audio.shape[0] / float(self._audio_sr)
         if not self.notes:
             return 0.0
         # Misma regla que render_notes + playback_mix: fin de la última nota + cola,
@@ -775,10 +853,12 @@ class TabPlayback:
         self._set_state("stopped")
 
     def close(self) -> None:
-        """Detiene todo y libera la caché (llamar al destruir la pestaña)."""
+        """Detiene todo, libera la caché y borra los WAV exportados (llamar al destruir la pestaña)."""
         self.stop()
         self._cache.clear()
         self._audio = None
+        self._synth_out = self._original_out = None
+        self._remove_old_exports(keep=None)
 
     # ----------------------------------------------------------- preparación
     def _render_key(self) -> tuple[Any, ...]:
@@ -819,6 +899,17 @@ class TabPlayback:
         while len(self._cache) > self._cache_size:
             self._cache.popitem(last=False)
 
+    def _output_sr(self) -> int:
+        """Frecuencia (Hz) a la que se debe entregar el audio a la salida.
+
+        Es la del análisis salvo que la tarjeta ya haya rechazado esa
+        frecuencia (:attr:`SoundDeviceOutput.forced_sr`): entonces el audio se
+        prepara directamente a la que acepta, en segundo plano, y reproducir
+        (o reanudar, o saltar) es solo recortar el arreglo.
+        """
+        forced = getattr(self._output, "forced_sr", None)
+        return int(forced) if forced else self.sr
+
     def _prepare(self) -> None:
         """Deja listo ``self._audio`` (síntesis de la caché o en segundo plano) y arranca si hay inicio pendiente."""
         mode = self._effective_mode()
@@ -826,9 +917,11 @@ class TabPlayback:
             self._message("No hay audio original: se reproduce solo el MIDI sintetizado.")
         key = self._render_key()
         synth = self._cache_get(key)
-        if synth is not None:
+        out_sr = self._output_sr()
+        if synth is not None and out_sr == self.sr:
             # Rápido (décimas de segundo para 6 min): se mezcla en el hilo de la GUI.
             self._audio = playback_mix(self.original, synth, mode)
+            self._audio_sr = self.sr
             self._on_ready()
             return
         self._set_state("preparing")
@@ -837,17 +930,35 @@ class TabPlayback:
         self._in_flight = True
         generation = self._generation
         notes, original, sr, method, seed = list(self.notes), self.original, self.sr, self._method, self.seed
+        # Remuestreos ya hechos para esta misma síntesis / este mismo original (cambio de modo).
+        synth_ready = self._synth_out[2] if self._synth_out is not None and self._synth_out[:2] == (key, out_sr) \
+            else None
+        original_ready = (self._original_out[2] if self._original_out is not None
+                          and self._original_out[0] is original and self._original_out[1] == out_sr else None)
 
         def task(progress: ProgressCallback, cancel: threading.Event) -> _Prepared:
-            """Hilo trabajador: sintetiza y mezcla sin tocar el estado del reproductor."""
-            synth_out: np.ndarray | None = None
+            """Hilo trabajador: sintetiza, remuestrea si hace falta y mezcla, sin tocar el estado del reproductor."""
+            synth_out: np.ndarray | None = synth
             try:
-                progress(0.05, f"Sintetizando la tablatura ({len(notes)} notas)…")
-                synth_out = render_notes(notes, sr=sr, method=method, seed=seed)
+                if synth_out is None:
+                    progress(0.05, f"Sintetizando la tablatura ({len(notes)} notas)…")
+                    synth_out = render_notes(notes, sr=sr, method=method, seed=seed)
+                if cancel.is_set():
+                    raise CancelledError("Síntesis cancelada")
+                if out_sr == sr:
+                    progress(0.9, "Preparando la mezcla…")
+                    return _Prepared(synth_out, playback_mix(original, synth_out, mode), sr=sr)
+                # La tarjeta no acepta sr: se remuestrea AQUÍ (no en el hilo de la GUI) y una sola vez.
+                progress(0.6, f"Adaptando el audio a {out_sr} Hz (la frecuencia que acepta la tarjeta de sonido)…")
+                synth_rs = synth_ready if synth_ready is not None else _resample(synth_out, sr, out_sr)
+                original_rs = original_ready
+                if original_rs is None and original is not None:
+                    original_rs = _resample(original, sr, out_sr)
                 if cancel.is_set():
                     raise CancelledError("Síntesis cancelada")
                 progress(0.9, "Preparando la mezcla…")
-                return _Prepared(synth_out, playback_mix(original, synth_out, mode))
+                return _Prepared(synth_out, playback_mix(original_rs, synth_rs, mode), sr=out_sr,
+                                 synth_out=synth_rs, original_out=original_rs)
             except CancelledError:
                 return _Prepared(synth_out, None, error="se canceló la síntesis")
             except Exception as exc:  # noqa: BLE001 - se informa en el hilo de la GUI
@@ -859,6 +970,10 @@ class TabPlayback:
             self._in_flight = False
             if result.synth is not None:
                 self._cache_put(key, result.synth)  # sirve aunque la petición ya no esté vigente
+            if result.synth_out is not None:
+                self._synth_out = (key, result.sr, result.synth_out)
+            if result.original_out is not None:
+                self._original_out = (original, result.sr, result.original_out)
             if generation != self._generation:
                 # La fuente o el modo cambiaron mientras se sintetizaba: se atiende la petición actual.
                 if self._state == "preparing":
@@ -871,12 +986,14 @@ class TabPlayback:
                 self._message(f"No se pudo preparar el audio de la tablatura: {result.error}")
                 return
             self._audio = result.audio
+            self._audio_sr = result.sr
             self._on_ready()
 
         if self._run_in_background is None:
             done(task(lambda _f, _m="": None, threading.Event()))
             return
-        started = self._run_in_background("Sintetizando la tablatura", task, done)
+        title = "Sintetizando la tablatura" if synth is None else f"Adaptando el audio de la tablatura a {out_sr} Hz"
+        started = self._run_in_background(title, task, done)
         if started is False:
             self._in_flight = False
             self._pending_start = None
@@ -900,9 +1017,17 @@ class TabPlayback:
         if not self._output.available:
             self._play_external(start_s)
             return
-        first = int(round(start_s * self.sr))
+        if self._audio_sr != self._output_sr():
+            # La tarjeta rechazó esta frecuencia en la reproducción anterior: se prepara el
+            # audio a la que acepta en segundo plano (antes se remuestreaba aquí, en el hilo
+            # de la GUI, en cada ▶, reanudación o salto: hasta 1 s congelada).
+            self._audio = None
+            self._pending_start = start_s
+            self._prepare()
+            return
+        first = int(round(start_s * self._audio_sr))
         try:
-            latency = self._output.play(self._audio[first:], self.sr)
+            latency = self._output.play(self._audio[first:], self._audio_sr)
         except Exception as exc:  # noqa: BLE001 - se informa al usuario
             self._set_state("stopped")
             self._message(f"No se pudo reproducir la tablatura: {exc}")
@@ -916,7 +1041,9 @@ class TabPlayback:
 
     def _tick(self) -> None:
         """Aviso periódico (hilo de la GUI): posición, fin de la pista o interrupción externa."""
-        self._tick_job = None
+        # Se cancela el aviso pendiente (si esta llamada no vino de él): nunca hay dos cadenas
+        # de avisos a la vez, aunque alguien llame a _tick directamente.
+        self._cancel_tick()
         if self._state != "playing":
             return
         position, duration = self.position_s, self.duration_s
@@ -961,18 +1088,21 @@ class TabPlayback:
         assert self._audio is not None
         self._set_state("stopped")
         self.export_dir.mkdir(parents=True, exist_ok=True)
-        first = int(round(start_s * self.sr))
+        first = int(round(start_s * self._audio_sr))
         audio = np.clip(self._audio[first:], -1.0, 1.0)
         mode = self._effective_mode()
         suffix = "" if first == 0 else f"_desde_{start_s:.1f}s"
         try:
             wav = self._write_unique(self.export_dir / f"{self.name}_{mode}{suffix}.wav",
-                                     lambda p: sf.write(str(p), audio, self.sr, subtype="PCM_16"))
+                                     lambda p: sf.write(str(p), audio, self._audio_sr, subtype="PCM_16"))
             midi = self._write_unique(self.export_dir / f"{self.name}.mid", lambda p: export_midi(self.notes, p))
         except Exception as exc:  # noqa: BLE001 - se informa al usuario
             self._message(f"No se pudo guardar el audio de la tablatura en {self.export_dir}: {exc}")
             return
         self.last_export = wav
+        # Cada ▶ desde otro instante escribe un WAV nuevo (hasta ~30 MB con 6 min en estéreo):
+        # se borran los anteriores para que la carpeta no crezca sin límite en una clase.
+        self._remove_old_exports(keep=wav)
         reason = self._output.error or "sounddevice no está disponible"
         try:
             self._opener(wav)
@@ -987,14 +1117,39 @@ class TabPlayback:
 
     @staticmethod
     def _write_unique(path: Path, writer: Callable[[Path], Any]) -> Path:
-        """Escribe con ``writer``; si el archivo está bloqueado (Windows: abierto en otro programa), usa otro nombre."""
+        """Escribe con ``writer``; si el archivo está bloqueado (Windows: abierto en otro programa), usa otro nombre.
+
+        soundfile informa de un archivo que no puede abrir con
+        ``soundfile.LibsndfileError``, que hereda de ``RuntimeError`` (no de
+        ``OSError``, que es lo que lanza ``open`` en mido): se capturan ambos.
+        """
         try:
             writer(path)
             return path
-        except OSError:
+        except (OSError, RuntimeError) as exc:
             alternative = path.with_name(f"{path.stem}_{time.strftime('%H%M%S')}{path.suffix}")
+            logger.info("No se pudo escribir %s (%s); se usa %s.", path.name, exc, alternative.name)
             writer(alternative)
             return alternative
+
+    def _remove_old_exports(self, keep: Path | None) -> None:
+        """Borra los WAV exportados antes (salvo ``keep``); los bloqueados se reintentan la próxima vez.
+
+        Parameters
+        ----------
+        keep : Path | None
+            WAV recién escrito (el que está abriendo el reproductor del sistema),
+            o None para borrarlos todos (al cerrar).
+        """
+        remaining: list[Path] = []
+        for path in self._exported:
+            if keep is not None and path == keep:
+                continue
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:  # Windows: el reproductor del sistema aún lo tiene abierto
+                remaining.append(path)
+        self._exported = remaining + ([keep] if keep is not None else [])
 
     # ------------------------------------------------------------- avisos
     def _set_state(self, state: str) -> None:

@@ -80,11 +80,10 @@ from typing import TYPE_CHECKING, Any
 
 from matplotlib.figure import Figure
 from matplotlib.patches import FancyBboxPatch, Rectangle
-from matplotlib.text import Annotation
 
-from gui.widgets import UI_ACCENT, PlotFrame, Tooltip, show_error
+from gui.widgets import UI_ACCENT, HoverTooltip, PlotFrame, Tooltip, show_error, tree_heading_at
 from src import plots
-from src.config import ALGO_COLORS, ALGORITHMS, RESULTS_DIR, Config, ProgressCallback
+from src.config import ALGO_COLORS, ALGO_LABELS, ALGORITHMS, RESULTS_DIR, Config, ProgressCallback
 from src.experiments import (
     ALGO_SHORT,
     SWEEP_SPECS,
@@ -486,23 +485,6 @@ def experiment_plan(cfg: Config, analysis: AnalysisResult | None) -> dict[str, s
     return plan
 
 
-def _drop_subtitle(fig: Figure) -> None:
-    """Quita el subtítulo de una figura de :mod:`src.plots` (modo compacto).
-
-    :func:`src.plots._titles` reserva líneas en blanco bajo el título
-    (``suptitle``) y ancla ahí el subtítulo con una ``Annotation``; se quitan
-    ambas cosas para que los ejes ganen ese espacio. Las figuras exportadas no
-    se tocan (se dibujan de nuevo, completas).
-    """
-    sup = getattr(fig, "_suptitle", None)
-    if sup is None:
-        return
-    for artist in list(fig.artists):
-        if isinstance(artist, Annotation) and getattr(artist, "xycoords", None) is sup:
-            artist.remove()
-    sup.set_text(sup.get_text().rstrip("\n"))
-
-
 def _autoscroll(scrollbar: ttk.Scrollbar) -> Callable[[str, str], None]:
     """``*scrollcommand`` que muestra la barra solo cuando el contenido no cabe.
 
@@ -517,105 +499,6 @@ def _autoscroll(scrollbar: ttk.Scrollbar) -> Callable[[str, str], None]:
         scrollbar.set(first, last)
 
     return set_
-
-
-class _HeadingTooltip(Tooltip):
-    """Tooltip de la tabla que explica la columna bajo el ratón (solo en los encabezados).
-
-    Parameters
-    ----------
-    tree : ttk.Treeview
-        Tabla a la que se asocia.
-    help_for : Callable[[str], str]
-        Función ``columna → texto`` (``"#0"`` es la columna del algoritmo).
-    """
-
-    def __init__(self, tree: ttk.Treeview, help_for: Callable[[str], str]) -> None:
-        """Asocia el tooltip a ``tree`` y sigue el movimiento del ratón."""
-        self._tree = tree
-        self._help_for = help_for
-        self._hover: str | None = None
-        super().__init__(tree, self._current_text, wraplength=340)
-        tree.bind("<Motion>", self._on_motion, add="+")
-
-    def column_under_pointer(self) -> str | None:
-        """Columna cuyo encabezado está bajo el puntero (None fuera de los encabezados)."""
-        tree = self._tree
-        x = tree.winfo_pointerx() - tree.winfo_rootx()
-        y = tree.winfo_pointery() - tree.winfo_rooty()
-        return self.column_at(x, y)
-
-    def column_at(self, x: int, y: int) -> str | None:
-        """Columna del encabezado en ``(x, y)`` (px relativos a la tabla) o None.
-
-        Parameters
-        ----------
-        x, y : int
-            Coordenadas dentro de la tabla (px).
-
-        Returns
-        -------
-        str | None
-            ``"#0"`` para la columna del algoritmo, la clave de la columna en
-            las demás, o None si el punto no está sobre un encabezado.
-        """
-        tree = self._tree
-        if tree.identify_region(x, y) not in ("heading", "separator"):
-            return None
-        column = tree.identify_column(x)
-        if column == "#0":
-            return "#0"
-        try:
-            index = int(column.lstrip("#")) - 1
-        except ValueError:
-            return None
-        shown = _display_columns(tree)
-        return shown[index] if 0 <= index < len(shown) else None
-
-    def _current_text(self) -> str:
-        """Texto de la columna actual (vacío = no mostrar nada)."""
-        column = self.column_under_pointer()
-        return self._help_for(column) if column else ""
-
-    def _on_motion(self, _event: tk.Event) -> None:
-        """Reinicia el tooltip cuando el ratón pasa a otro encabezado."""
-        column = self.column_under_pointer()
-        if column != self._hover:
-            self._hover = column
-            self._hide()
-            if column:
-                self._schedule()
-
-    def _show(self) -> None:
-        """Muestra el texto junto al puntero, siempre dentro de la pantalla."""
-        text = self._current_text()
-        if not text or self._tip is not None:
-            return
-        tree = self._tree
-        self._tip = tip = tk.Toplevel(tree)
-        tip.withdraw()
-        tip.wm_overrideredirect(True)
-        tk.Label(tip, text=text, justify="left", wraplength=self.wraplength, background="#fffbe8",
-                 foreground=plots.TEXT_PRIMARY, relief="solid", borderwidth=1, padx=8, pady=6,
-                 font=("TkDefaultFont", 9)).pack()
-        tip.update_idletasks()
-        x = tree.winfo_pointerx() + 14
-        y = tree.winfo_pointery() + 18
-        if y + tip.winfo_reqheight() > tree.winfo_screenheight():
-            y = tree.winfo_pointery() - tip.winfo_reqheight() - 10
-        x = min(x, max(0, tree.winfo_screenwidth() - tip.winfo_reqwidth() - 4))
-        tip.wm_geometry(f"+{x}+{y}")
-        tip.deiconify()
-
-
-def _display_columns(tree: ttk.Treeview) -> list[str]:
-    """Columnas visibles de ``tree`` en orden (resuelve ``displaycolumns = "#all"``)."""
-    shown = tree.cget("displaycolumns")
-    shown = list(tree.tk.splitlist(shown) if isinstance(shown, str) else shown)
-    if not shown or shown == ["#all"]:
-        columns = tree.cget("columns")
-        return list(tree.tk.splitlist(columns) if isinstance(columns, str) else columns)
-    return [str(c) for c in shown]
 
 
 # ---------------------------------------------------------------------------
@@ -817,6 +700,7 @@ class CompareTab(ttk.Frame):
         )
         self.description.tag_configure("warn", foreground=WARN_FG, font=self._bold_font)
         self.description.tag_configure("note", foreground=plots.TEXT_SECONDARY)
+        self.description.tag_configure("data_head", font=self._bold_font)
         self.description.grid(row=0, column=0, sticky="nsew")
         desc_scroll = ttk.Scrollbar(desc_frame, orient="vertical", command=self.description.yview)
         desc_scroll.grid(row=0, column=1, sticky="ns", padx=(4, 0))
@@ -898,7 +782,12 @@ class CompareTab(ttk.Frame):
                                   height=len(ALGORITHMS) + len(ORACLES), selectmode="browse",
                                   style="Compare.Treeview")
         self.table.heading("#0", text="Algoritmo", anchor="w")
-        self.table.column("#0", width=216, minwidth=200, stretch=False, anchor="w")
+        # Ancho de la primera columna: el nombre más largo («Oráculo de cadena (Viterbi)») + el
+        # cuadro de color + la sangría del árbol; con 216 px fijos se cortaba.
+        longest = max(tkfont.nametofont("TkDefaultFont").measure(ALGO_LABELS.get(k, k))
+                      for k in (*ALGORITHMS, *ORACLES))
+        first_width = max(216, longest + 40)
+        self.table.column("#0", width=first_width, minwidth=first_width - 16, stretch=False, anchor="w")
         for col in TABLE_COLUMNS:
             self.table.heading(col.key, text=col.heading, anchor="center")
             self.table.column(col.key, width=col.width, minwidth=col.width - 14, stretch=True, anchor="center")
@@ -908,7 +797,8 @@ class CompareTab(ttk.Frame):
         table_scroll.grid(row=1, column=0, sticky="ew")
         self.table.configure(xscrollcommand=_autoscroll(table_scroll))
         self.table.bind("<<TreeviewSelect>>", self._on_table_select)
-        self.table_tooltip = _HeadingTooltip(self.table, self._column_help)
+        self.table_tooltip = HoverTooltip(self.table, lambda x, y: tree_heading_at(self.table, x, y),
+                                          self._column_help, delay_ms=500, wraplength=340)
         self.table_message = tk.Label(tree_frame, text="La tabla aparecerá aquí al terminar el experimento.",
                                       background=self._field_bg, foreground=plots.TEXT_SECONDARY,
                                       font=("TkDefaultFont", 10))
@@ -1491,7 +1381,7 @@ class CompareTab(ttk.Frame):
         self.plot_state = "missing" if missing else "plot"
         self._drawn_call = (fn, args, kwargs) if not missing else None
         if self.plot.canvas.get_tk_widget().winfo_height() < COMPACT_CANVAS_PX:
-            _drop_subtitle(fig)
+            plots.drop_subtitle(fig)
 
     def _finish_draw(self) -> None:
         """Reinicia la barra de herramientas, refresca el lienzo y los controles."""
@@ -1736,8 +1626,17 @@ class CompareTab(ttk.Frame):
         reason = self.missing_reason(spec.key)
         if reason:
             text.insert("end", f"⚠ {reason}\n", "warn")
-        text.insert("end", spec.description)
         result = self.result
+        # Primero, lo que muestran los DATOS de este experimento (qué algoritmo quedó arriba o
+        # abajo, si el regret se aplana); después, la teoría para leer la gráfica. Así el texto
+        # proyectado nunca contradice a la gráfica que lo acompaña.
+        observed = plots.describe_result(spec.key, result) if result is not None and reason is None else ""
+        if observed:
+            prefix = "En este experimento"
+            head, rest = (prefix, observed[len(prefix):]) if observed.startswith(prefix) else ("", observed)
+            text.insert("end", head, "data_head")
+            text.insert("end", rest + "\n")
+        text.insert("end", spec.description)
         if spec.key in ("arm_distribution", "q_evolution") and result is not None and result.example is not None:
             example = result.example
             text.insert("end", f"\nSegmento de ejemplo: n.º {example.position} ({len(example.arm_labels)} brazos "

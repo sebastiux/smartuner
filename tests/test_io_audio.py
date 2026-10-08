@@ -82,6 +82,31 @@ def test_load_resamples_and_mixes_to_mono(tmp_path: Path) -> None:
 
 
 @needs_ffmpeg
+def test_ffmpeg_mono_downmix_is_channel_average(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Estéreo → mono con ffmpeg es el PROMEDIO (L + R)/2, no (L + R)/√2, e igual que con soundfile.
+
+    Regresión: sin ``-rematrix_maxval 1.0`` un bajo centrado (L = R) a pico 0.999
+    llegaba a 1.41 y la pestaña Audio lo reproducía saturado.
+    """
+    sr = 22050
+    t = np.arange(sr) / sr
+    left = (0.999 * np.sin(2 * np.pi * 110.0 * t)).astype(np.float32)
+    right = (0.5 * np.sin(2 * np.pi * 55.0 * t)).astype(np.float32)
+    centered = tmp_path / "centrado.wav"
+    sf.write(str(centered), np.stack([left, left], axis=1), sr, subtype="FLOAT")
+    y, _ = load_audio(centered, sr=sr)
+    assert float(np.max(np.abs(y))) <= 1.0
+    np.testing.assert_allclose(y[:sr], left, atol=1e-5)
+    mixed = tmp_path / "mezcla.wav"
+    sf.write(str(mixed), np.stack([left, right], axis=1), sr, subtype="FLOAT")
+    y_ffmpeg, _ = load_audio(mixed, sr=sr)
+    np.testing.assert_allclose(y_ffmpeg[:sr], (left + right) / 2, atol=1e-5)
+    monkeypatch.setattr(io_audio, "find_ffmpeg", lambda: None)
+    y_soundfile, _ = load_audio(mixed, sr=sr)
+    np.testing.assert_allclose(y_ffmpeg[:sr], y_soundfile[:sr], atol=1e-5)
+
+
+@needs_ffmpeg
 def test_stereo_with_ffmpeg_keeps_channels(stereo_mp3: Path) -> None:
     """``channels=2`` con ffmpeg: forma (2, n), cada canal con su tono y la duración correcta."""
     y, sr = load_audio(stereo_mp3, sr=44100, channels=2)

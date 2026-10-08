@@ -84,6 +84,9 @@ FAKE_RUNNER = textwrap.dedent(
         print("ERROR: No se pudo cargar el modelo: se necesita conexión a Internet la primera vez (~80 MB).",
               flush=True)
         sys.exit(4)
+    if mode == "nodeps":  # torch instalado pero roto (p. ej. WinError 126 en Windows)
+        print("ERROR: No se pudo importar PyTorch/Demucs ([WinError 126] c10.dll).", flush=True)
+        sys.exit(3)
     passes = 2 if mode == "bag" else 1
     print("PROGRESO: 10% separando 1.0 s de audio...", flush=True)
     print(f"SEPARANDO: {passes}", flush=True)
@@ -121,7 +124,7 @@ class FakeRunner:
     log: Path
 
     def __call__(self, mode: str = "ok", delay: float = 0.0) -> dict[str, str]:
-        """Variables de entorno para lanzar el runner falso en modo ``mode`` (ok, bag, fail, hang, nooutput)."""
+        """Variables de entorno para lanzar el runner falso en modo ``mode`` (ok, bag, fail, nodeps, hang, nooutput)."""
         env = dict(os.environ)
         env["PYTHONPATH"] = os.pathsep.join(p for p in (str(self.root), env.get("PYTHONPATH", "")) if p)
         env["FAKE_RUNNER_MODE"] = mode
@@ -479,6 +482,35 @@ def test_nonzero_exit_raises_with_runner_explanation(tmp_path: Path, song: Path,
     assert "se necesita conexión a Internet la primera vez (~80 MB)" in message
     assert "modelo roto" in message
     assert list(cache.iterdir()) == []
+
+
+def test_runner_missing_deps_raises_deps_error(tmp_path: Path, song: Path, fake_runner: FakeRunner) -> None:
+    """Si el runner sale con EXIT_MISSING_DEPS, separate_bass lanza SeparationDepsError (el pipeline recurre a HPSS)."""
+    with pytest.raises(separation.SeparationDepsError, match="WinError 126"):
+        _run(song, tmp_path / "cache", fake_runner(mode="nodeps"))
+
+
+def test_runner_with_broken_torch_dll_exits_with_missing_deps(tmp_path: Path, song: Path,
+                                                             monkeypatch: pytest.MonkeyPatch,
+                                                             capsys: pytest.CaptureFixture[str]) -> None:
+    """Un torch que falla al importarse con OSError (DLL de Windows) da EXIT_MISSING_DEPS y una línea ERROR: útil."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def broken_import(name: str, *args: object, **kwargs: object) -> object:
+        """``import torch`` falla como en Windows sin el Redistributable de Visual C++."""
+        if name == "torch":
+            raise OSError('[WinError 126] No se puede encontrar el módulo especificado. Error loading "c10.dll"')
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.delitem(sys.modules, "torch", raising=False)
+    monkeypatch.setattr(builtins, "__import__", broken_import)
+    code = demucs_runner.main(["--input", str(song), "--output", str(tmp_path / "b.wav")])
+    out = capsys.readouterr().out
+    assert code == demucs_runner.EXIT_MISSING_DEPS
+    error = next(line for line in out.splitlines() if line.startswith(demucs_runner.ERROR_PREFIX))
+    assert "WinError 126" in error and "Visual C++" in error
 
 
 def test_missing_stem_raises(tmp_path: Path, song: Path, fake_runner: FakeRunner) -> None:

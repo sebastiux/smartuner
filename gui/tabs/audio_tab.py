@@ -32,6 +32,10 @@ Sincronización con las demás pestañas
 * ``config_changed`` → casilla de Demucs, tolerancia del emparejamiento con el
   ground truth y aviso de «analiza de nuevo».
 * ``busy_changed`` → deshabilita las acciones mientras hay una tarea en curso.
+* ``audio_output_claimed`` → si otra pestaña va a reproducir (la tablatura
+  sintetizada), se detiene la reproducción de aquí; antes de reproducir, esta
+  pestaña reclama la salida (:meth:`gui.app.SmartunerApp.claim_audio_output`)
+  y la tablatura se pausa. Nunca suenan dos cosas ni queda un botón incoherente.
 
 Por rendimiento la figura (≈ 0.3 s por redibujo) se redibuja de forma diferida
 (se agrupan selecciones rápidas, p. ej. al recorrer la tabla con las flechas) y
@@ -41,17 +45,17 @@ solo cuando la pestaña está visible; al volver a ella se redibuja si hizo falt
 from __future__ import annotations
 
 import logging
+import time
 import tkinter as tk
-from collections.abc import Callable, Sequence
+from collections.abc import Hashable, Sequence
 from pathlib import Path
+from tkinter import font as tkfont
 from tkinter import ttk
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
-from matplotlib.text import Annotation
-from matplotlib.ticker import FixedFormatter, FixedLocator
 
-from gui.widgets import AudioPlayer, PlotFrame, Tooltip, show_error
+from gui.widgets import AudioPlayer, HoverTooltip, PlotFrame, Tooltip, show_error, tree_heading_at
 from src import plots
 from src.experiments import match_segments_to_gt
 from src.pitch import midi_to_name
@@ -70,6 +74,8 @@ SOURCE = "audio"
 
 #: Espera (ms) antes de redibujar la figura: agrupa selecciones muy seguidas.
 REDRAW_DELAY_MS = 40
+#: Espera máxima (ms) de un redibujo por cambio de selección (pistas largas; ver ``_request_redraw``).
+SELECTION_REDRAW_MAX_MS = 250
 
 #: Fracción inicial de la altura dedicada a la figura (el resto es la tabla).
 PLOT_HEIGHT_FRACTION = 0.63
@@ -85,6 +91,14 @@ MIN_PLOT_PX = 340
 #: de eje cortas; si no, *constrained layout* no cabe y los paneles colapsan.
 COMPACT_HEIGHT_PX = 360
 
+#: Pistas más largas que esto (s): al seleccionar una nota desde otra pestaña (o con
+#: «Acercar a la nota») la figura se acerca a ella; con la pista entera, una nota de
+#: 0.2 s en 6 min sería una línea de un píxel.
+ZOOM_LONG_TRACK_S: float = 20.0
+
+#: Margen (s) a cada lado de la nota al acercarse a ella.
+ZOOM_MARGIN_S: float = 2.0
+
 #: Ancho (px) de la columna de valores del panel de información, normal y en ventanas
 #: estrechas (zona inferior de menos de NARROW_WIDTH_PX), para dejar sitio a la tabla.
 INFO_WRAP_PX = 290
@@ -93,9 +107,6 @@ NARROW_WIDTH_PX = 1150
 
 #: Altura (px) del marco de la tabla por debajo de la cual se oculta su leyenda.
 LEGEND_MIN_HEIGHT_PX = 200
-
-#: Marcas del eje de frecuencia que se conservan en modo compacto (una por octava).
-COMPACT_NOTE_TICKS: tuple[str, ...] = ("E1", "G2", "G3", "G4", "G5")
 
 #: Color de fondo del aviso «analiza de nuevo» (ámbar muy claro, tinta oscura).
 BANNER_BG = "#fdf3d8"
@@ -135,12 +146,20 @@ COLUMNS: tuple[tuple[str, str, int, str, str], ...] = (
      "nota real empieza cerca."),
 )
 
+#: Ancho mínimo (px) de una columna de la tabla de segmentos.
+COLUMN_MIN_WIDTH: int = 34
+
+#: Fuente de los encabezados de la tabla de segmentos.
+HEADING_FONT: tuple[str, int, str] = ("TkDefaultFont", 9, "bold")
+
 #: Ayuda de cada dato del panel de información: (clave, etiqueta, ayuda).
 INFO_FIELDS: tuple[tuple[str, str, str], ...] = (
     ("file", "Archivo", "Archivo de audio elegido. Pasa el ratón sobre el valor para ver la ruta completa."),
     ("source", "Señal analizada",
-     "Archivo que realmente se analiza: el original o, si se activó «Separar bajo de mezcla», el "
-     "stem de bajo que devuelve Demucs (se guarda en la caché)."),
+     "Qué señal se analiza de verdad. Sin «Separar bajo de mezcla», el archivo original. Con la casilla "
+     "marcada depende del método de separación (Configuración): Demucs escribe un stem de bajo en la caché "
+     "y se analiza ese archivo; HPSS (si Demucs no está instalado, con el método «auto») separa la parte "
+     "armónica y aplica un pasa-bajas sobre el original en memoria, sin escribir ningún archivo."),
     ("duration", "Duración", "Duración de la pista en segundos."),
     ("sr", "Frec. de muestreo",
      "El audio se decodifica con ffmpeg a mono y se remuestrea a esta frecuencia. La frecuencia "
@@ -177,98 +196,6 @@ def _plural(n: int, word: str) -> str:
     ('1 nota', '3 notas')
     """
     return f"{n} {word}" if n == 1 else f"{n} {word}s"
-
-
-class _TreeHelpTooltip(Tooltip):
-    """Tooltip de la tabla cuyo texto depende de lo que hay bajo el ratón.
-
-    Sobre un encabezado explica la columna; sobre una fila descartada explica
-    por qué se descartó; en el resto de la tabla no muestra nada (no tapa las
-    filas). Al moverse a otra zona se reinicia la espera del tooltip.
-
-    Parameters
-    ----------
-    tree : ttk.Treeview
-        Tabla a la que se asocia.
-    text_for : Callable[[str, str], str]
-        Función ``(región, id)`` → texto, donde ``región`` es ``"heading"``
-        (``id`` = columna) o ``"row"`` (``id`` = fila).
-    """
-
-    def __init__(self, tree: ttk.Treeview, text_for: Callable[[str, str], str]) -> None:
-        """Asocia el tooltip a ``tree`` y sigue el movimiento del ratón (ver la clase)."""
-        self._tree = tree
-        self._text_for = text_for
-        self._hover: tuple[str, str] | None = None
-        super().__init__(tree, self._current_text, wraplength=340)
-        tree.bind("<Motion>", self._on_motion, add="+")
-
-    def _hover_key(self) -> tuple[str, str] | None:
-        """Zona bajo el puntero: ``("heading", columna)``, ``("row", fila)`` o None."""
-        tree = self._tree
-        x = tree.winfo_pointerx() - tree.winfo_rootx()
-        y = tree.winfo_pointery() - tree.winfo_rooty()
-        region = tree.identify_region(x, y)
-        if region in ("heading", "separator"):
-            column = tree.identify_column(x)  # "#n" (1 = primera columna visible)
-            try:
-                index = int(column.lstrip("#")) - 1
-            except ValueError:
-                return None
-            shown = _display_columns(tree)
-            return ("heading", shown[index]) if 0 <= index < len(shown) else None
-        row = tree.identify_row(y)
-        return ("row", row) if row else None
-
-    def _current_text(self) -> str:
-        """Texto para la zona actual (cadena vacía = no mostrar)."""
-        key = self._hover_key()
-        return self._text_for(*key) if key else ""
-
-    def hide(self) -> None:
-        """Oculta el tooltip (p. ej. al hacer clic en la tabla)."""
-        self._hide()
-
-    def _on_motion(self, _event: tk.Event) -> None:
-        """Reinicia el tooltip cuando el ratón pasa a otra columna o fila."""
-        key = self._hover_key()
-        if key != self._hover:
-            self._hover = key
-            self._hide()
-            self._schedule()
-
-    def _show(self) -> None:
-        """Muestra el texto junto al puntero (no debajo de toda la tabla) y dentro de la pantalla."""
-        text = self._current_text()
-        if not text or self._tip is not None:
-            return
-        tree = self._tree
-        self._tip = tip = tk.Toplevel(tree)
-        tip.withdraw()  # se coloca antes de mostrarse (sin parpadeo en la esquina)
-        tip.wm_overrideredirect(True)
-        tk.Label(tip, text=text, justify="left", wraplength=self.wraplength, background="#fffbe8",
-                 foreground=plots.TEXT_PRIMARY, relief="solid", borderwidth=1, padx=8, pady=6,
-                 font=("TkDefaultFont", 9)).pack()
-        tip.update_idletasks()
-        x = tree.winfo_pointerx() + 14
-        y = tree.winfo_pointery() + 18
-        if y + tip.winfo_reqheight() > tree.winfo_screenheight():
-            y = tree.winfo_pointery() - tip.winfo_reqheight() - 10
-        x = min(x, max(0, tree.winfo_screenwidth() - tip.winfo_reqwidth() - 4))
-        tip.wm_geometry(f"+{x}+{y}")
-        tip.deiconify()
-
-
-def _display_columns(tree: ttk.Treeview) -> list[str]:
-    """Columnas visibles de ``tree`` en orden (resuelve ``displaycolumns = "#all"``)."""
-    shown = tree.cget("displaycolumns")
-    if isinstance(shown, str):
-        shown = tree.tk.splitlist(shown)
-    shown = list(shown)
-    if not shown or shown == ["#all"]:
-        columns = tree.cget("columns")
-        return list(tree.tk.splitlist(columns) if isinstance(columns, str) else columns)
-    return shown
 
 
 class AudioTab(ttk.Frame):
@@ -323,11 +250,14 @@ class AudioTab(ttk.Frame):
         self._kept_starts = np.zeros(0)
         self._kept_ends = np.zeros(0)
         self._redraw_job: str | None = None
+        self._last_draw_ms = 0.0  # lo que tardó en construirse la última figura (ms)
         self._dirty = True
         self._keep_view = False
+        self._zoom_selection_pending = False   # acercar la figura a la selección en el próximo dibujo
         self._home_view: tuple[tuple[float, float], ...] | None = None
         self._toolbar_wrapped: bool | None = None
         self._sash_user = False
+        self._sash_job: str | None = None
 
         self._setup_styles()
         self.columnconfigure(0, weight=1)
@@ -341,6 +271,7 @@ class AudioTab(ttk.Frame):
         events.subscribe("segment_selected", self._on_segment_selected)
         events.subscribe("config_changed", self._on_config_changed)
         events.subscribe("busy_changed", self._on_busy_changed)
+        events.subscribe("audio_output_claimed", self._on_audio_output_claimed)
         self.bind("<Map>", self._on_map, add="+")
 
         self._refresh_info()
@@ -367,7 +298,7 @@ class AudioTab(ttk.Frame):
         style.configure("AudioBar.TButton", padding=(6, 4), width=0)
         style.configure("AudioBar.Accent.TButton", padding=(6, 4), width=0)
         style.configure("Audio.Treeview", rowheight=22)
-        style.configure("Audio.Treeview.Heading", font=("TkDefaultFont", 9, "bold"))
+        style.configure("Audio.Treeview.Heading", font=HEADING_FONT)
 
     def _build_toolbar(self) -> None:
         """Barra superior: acciones de análisis a la izquierda y reproducción a la derecha."""
@@ -414,6 +345,14 @@ class AudioTab(ttk.Frame):
         self.btn_play_segment.pack(side="left", padx=(4, 0))
         self.btn_stop = ttk.Button(playback, text="■ Detener", style="AudioBar.TButton", command=self._on_stop)
         self.btn_stop.pack(side="left", padx=(4, 0))
+        ttk.Separator(playback, orient="vertical").pack(side="left", fill="y", padx=6, pady=2)
+        self.btn_zoom_note = ttk.Button(playback, text="Acercar a la nota", style="AudioBar.TButton",
+                                        command=self.zoom_to_selection)
+        self.btn_zoom_note.pack(side="left")
+        Tooltip(self.btn_zoom_note, f"Acerca la figura al segmento seleccionado (±{ZOOM_MARGIN_S:g} s) para ver sus "
+                                    "onsets, su f0 y su espectro. En pistas de más de "
+                                    f"{ZOOM_LONG_TRACK_S:g} s se hace solo al elegir una nota en otra pestaña. "
+                                    "«Inicio» (la casa de la barra de la figura) vuelve a la pista completa.")
         Tooltip(self.btn_play_all, lambda: self._play_help("Reproduce la pista completa tal como se analizó "
                                                            "(el stem de bajo si hubo separación)."))
         Tooltip(self.btn_play_segment, lambda: self._play_help("Reproduce solo el segmento seleccionado (clic en "
@@ -543,7 +482,7 @@ class AudioTab(ttk.Frame):
                             style="Audio.Treeview")
         for cid, heading, width, anchor, _help in COLUMNS:
             tree.heading(cid, text=heading, anchor=anchor)
-            tree.column(cid, width=width, minwidth=34, anchor=anchor, stretch=True)
+            tree.column(cid, width=width, minwidth=COLUMN_MIN_WIDTH, anchor=anchor, stretch=True)
         tree.tag_configure("discarded", foreground=DISCARDED_FG, background=DISCARDED_BG)
         self._shown_columns: tuple[str, ...] = tuple(ids)
         tree.grid(row=0, column=0, sticky="nsew")
@@ -555,7 +494,11 @@ class AudioTab(ttk.Frame):
         tree.bind("<<TreeviewSelect>>", self._on_tree_select, add="+")
         tree.bind("<ButtonPress-1>", self._on_tree_press, add="+")
         tree.bind("<Double-Button-1>", self._on_tree_double_click, add="+")
-        self._tree_tooltip = _TreeHelpTooltip(tree, self._tree_help)
+        # Al cambiar el ancho de la tabla (ventana redimensionada, pestaña que se muestra por
+        # primera vez) se vuelven a repartir las columnas: así «Real (GT)» nunca queda fuera.
+        self._fitted_width = 0
+        tree.bind("<Configure>", lambda _e: self._fit_columns(), add="+")
+        self._tree_tooltip = HoverTooltip(tree, self._tree_zone, self._tree_help, delay_ms=500, wraplength=340)
 
         self.empty_table = ttk.Label(frame, text="", style="AudioEmpty.TLabel", anchor="center", justify="center")
         self.legend = ttk.Label(
@@ -599,11 +542,25 @@ class AudioTab(ttk.Frame):
             self._place_sash(self._sash_target(height))
 
     def _on_bottom_configure(self, event: tk.Event) -> None:
-        """En ventanas estrechas estrecha el panel de información para dar ancho a la tabla."""
+        """En ventanas estrechas estrecha el panel de información; si cambió de alto, recoloca el separador.
+
+        ttk.PanedWindow vuelve a repartir el alto cuando cambia el tamaño PEDIDO
+        de un panel (p. ej. el panel de información con los textos de un análisis
+        nuevo) y podía dejar la figura por debajo de :data:`MIN_PLOT_PX` a
+        1024×700 (sus paneles colapsaban). Mientras el usuario no haya movido el
+        separador, se vuelve a colocar donde corresponde.
+        """
         wrap = INFO_WRAP_NARROW_PX if event.width < NARROW_WIDTH_PX else INFO_WRAP_PX
         for label in self.info_values.values():
             if int(label.cget("wraplength")) != wrap:
                 label.configure(wraplength=wrap)
+        if not self._sash_user and self._sash_job is None:
+            self._sash_job = self.after_idle(self._reapply_sash_later)
+
+    def _reapply_sash_later(self) -> None:
+        """Callback diferido de :meth:`_on_bottom_configure` (agrupa varios ``<Configure>``)."""
+        self._sash_job = None
+        self._reapply_sash()
 
     def _on_segments_configure(self, event: tk.Event) -> None:
         """Oculta la leyenda de la tabla cuando la zona inferior es muy baja (más filas visibles)."""
@@ -683,8 +640,20 @@ class AudioTab(ttk.Frame):
         """Ruta completa de la señal analizada."""
         return str(self.analysis.source_path) if self.analysis is not None else ""
 
-    def _tree_help(self, region: str, ident: str) -> str:
-        """Texto del tooltip de la tabla según la zona (encabezado o fila descartada)."""
+    def _tree_zone(self, x: int, y: int) -> tuple[str, str] | None:
+        """Zona de la tabla en ``(x, y)``: ``("heading", columna)``, ``("row", fila)`` o None."""
+        column = tree_heading_at(self.tree, x, y)
+        if column is not None:
+            return ("heading", column)
+        row = self.tree.identify_row(y)
+        return ("row", row) if row else None
+
+    def _tree_help(self, zone: Hashable) -> str:
+        """Texto del tooltip de la tabla según la zona (encabezado: la columna; fila descartada: el motivo).
+
+        Sobre las filas conservadas no se muestra nada (el tooltip no tapa la tabla).
+        """
+        region, ident = zone  # type: ignore[misc]
         if region == "heading":
             for cid, heading, _w, _a, help_text in COLUMNS:
                 if cid == ident:
@@ -742,8 +711,14 @@ class AudioTab(ttk.Frame):
         position = self._valid_position(position)
         self._sync_tree_selection(position)
         self._update_controls()
+        if (source != SOURCE and position is not None and self.analysis is not None
+                and self.analysis.duration_s > ZOOM_LONG_TRACK_S):
+            # Elegida en otra pestaña (Tablatura, En vivo…): en una pista larga se acerca a ella.
+            self._zoom_selection_pending = True
+            if self.plot_state == "analysis" and self.drawn_selection == position:
+                self._request_redraw(keep_view=True, trailing=True)
         if self.analysis is not None and (self.plot_state != "analysis" or self.drawn_selection != position):
-            self._request_redraw(keep_view=True)
+            self._request_redraw(keep_view=True, trailing=True)
 
     def _on_config_changed(self, key: str | None = None, **_kwargs: Any) -> None:
         """Refleja cambios de configuración hechos en otras pestañas (o al cargar un JSON).
@@ -828,10 +803,17 @@ class AudioTab(ttk.Frame):
         self.player.stop()
         self.app.status.set_message("Reproducción detenida.")
 
+    def _on_audio_output_claimed(self, owner: str = "", **_kwargs: Any) -> None:
+        """Otra pestaña va a reproducir (o la ventana se cierra): se detiene la reproducción de aquí."""
+        if owner != SOURCE:
+            self.player.stop()
+
     def _play(self, y: np.ndarray, message: str) -> None:
         """Reproduce ``y`` a la frecuencia del análisis, mostrando los errores en un diálogo."""
         if not self.player.available or self.analysis is None:
             return
+        # Una sola salida de audio: la pestaña Tablatura pausa su reproducción (si la había).
+        self.app.claim_audio_output(SOURCE)
         try:
             self.player.play(y, self.analysis.sr)
         except Exception as exc:  # noqa: BLE001 - un fallo de audio no debe romper la GUI
@@ -876,8 +858,11 @@ class AudioTab(ttk.Frame):
     def _on_tree_double_click(self, event: tk.Event) -> None:
         """Doble clic en una fila conservada: la reproduce si hay reproductor."""
         row = self.tree.identify_row(event.y)
-        if row and self._row_position.get(row) is not None and self.player.available:
-            self._on_play_segment()
+        if row and self._row_position.get(row) is not None:
+            if self.player.available:
+                self._on_play_segment()
+            else:
+                self.zoom_to_selection()  # sin reproductor, el doble clic acerca la figura a la nota
 
     def _on_tree_select(self, _event: tk.Event | None = None) -> None:
         """Fila seleccionada → ``app.state.select_segment`` (las descartadas se saltan)."""
@@ -987,12 +972,48 @@ class AudioTab(ttk.Frame):
             return
         self._shown_columns = columns
         self.tree.configure(displaycolumns=list(columns))
+        self._fitted_width = 0
+        self._fit_columns()
+
+    def _fit_columns(self) -> None:
+        """Reparte el ancho ACTUAL de la tabla entre las columnas visibles, en proporción a su ancho nominal.
+
+        Escala hacia arriba y hacia abajo (sin bajar de :data:`COLUMN_MIN_WIDTH`).
+        Si la pestaña está oculta (``winfo_width() ≤ 1``, p. ej. el análisis
+        terminó con otra pestaña visible) no hace nada: el ``<Configure>`` que
+        llega al mostrarse la tabla vuelve a llamarla con el ancho real. Antes
+        los anchos se calculaban con la pestaña oculta y la columna «Real (GT)»
+        quedaba fuera de la vista.
+        """
+        available = self.tree.winfo_width() - 4  # bordes del Treeview
+        columns = self._shown_columns
+        if available <= COLUMN_MIN_WIDTH or not columns or available == self._fitted_width:
+            return
+        self._fitted_width = available
         nominal = {cid: width for cid, _h, width, _a, _help in COLUMNS}
         total = sum(nominal[c] for c in columns)
-        available = self.tree.winfo_width()
-        scale = available / total if available > total else 1.0
+        # Cada columna recibe primero lo que necesita su encabezado y el resto del ancho se
+        # reparte en proporción al ancho nominal; si ni los encabezados caben, se escala todo.
+        floors = self._heading_widths()
+        need = sum(floors[c] for c in columns)
+        if available >= need:
+            extra = available - need
+            widths = {cid: floors[cid] + int(extra * nominal[cid] / total) for cid in columns}
+        else:
+            widths = {cid: max(COLUMN_MIN_WIDTH, int(nominal[cid] * available / total)) for cid in columns}
+        # Redondeos y mínimos: el sobrante (o lo que falte) se ajusta en la columna más ancha.
+        widest = max(columns, key=lambda c: widths[c])
+        widths[widest] = max(COLUMN_MIN_WIDTH, widths[widest] + available - sum(widths.values()))
         for cid in columns:
-            self.tree.column(cid, width=int(nominal[cid] * scale))
+            self.tree.column(cid, width=widths[cid])
+
+    def _heading_widths(self) -> dict[str, int]:
+        """Ancho mínimo (px) de cada columna: el de su encabezado en negrita más el relleno."""
+        if not hasattr(self, "_heading_floor"):
+            heading_font = tkfont.Font(root=self, font=HEADING_FONT)
+            self._heading_floor = {cid: max(COLUMN_MIN_WIDTH, heading_font.measure(heading) + 14)
+                                   for cid, heading, _w, _a, _help in COLUMNS}
+        return self._heading_floor
 
     def _show_table_message(self, text: str | None) -> None:
         """Muestra (o quita) un mensaje centrado sobre la tabla vacía."""
@@ -1062,10 +1083,7 @@ class AudioTab(ttk.Frame):
         path = Path(analysis.path)
         source = Path(analysis.source_path)
         values["file"].configure(text=path.name)
-        if source != path:
-            values["source"].configure(text=f"{source.name} (stem de bajo de Demucs)")
-        else:
-            values["source"].configure(text="el archivo original (sin separar)")
+        values["source"].configure(text=self._source_summary(analysis))
         values["duration"].configure(text=f"{analysis.duration_s:.2f} s")
         values["sr"].configure(text=f"{analysis.sr:,} Hz".replace(",", " "))
         values["onsets"].configure(text=str(len(analysis.onsets_s)))
@@ -1075,6 +1093,27 @@ class AudioTab(ttk.Frame):
         # Los textos nuevos pueden ocupar más líneas: se recoloca el separador cuando
         # tkinter haya recalculado los tamaños pedidos.
         self.after(60, self._reapply_sash)
+
+    @staticmethod
+    def _source_summary(analysis: AnalysisResult) -> str:
+        """Texto de «Señal analizada» según la separación que se aplicó DE VERDAD.
+
+        ``source_path`` no basta: HPSS no escribe ningún archivo, así que con
+        HPSS ``source_path == path`` igual que sin separar. Se usa
+        ``analysis.separation_method`` (``"demucs"``, ``"hpss"`` o None).
+
+        Examples
+        --------
+        «bajo.wav (stem de bajo de Demucs)», «el archivo original, separado con
+        HPSS + pasa-bajas (en memoria)», «el archivo original (sin separar)».
+        """
+        method = getattr(analysis, "separation_method", None)
+        source = Path(analysis.source_path)
+        if method == "demucs" or (method is None and source != Path(analysis.path)):
+            return f"{source.name} (stem de bajo de Demucs)"
+        if method == "hpss":
+            return "el archivo original, separado con HPSS + pasa-bajas (en memoria)"
+        return "el archivo original (sin separar)"
 
     @staticmethod
     def _segments_summary(analysis: AnalysisResult) -> str:
@@ -1165,22 +1204,34 @@ class AudioTab(ttk.Frame):
         enable(self.btn_play_all, playable and has_audio)
         enable(self.btn_play_segment, playable and has_segment)
         enable(self.btn_stop, playable)
+        enable(self.btn_zoom_note, has_segment)
 
     # =================================================================== figura
-    def _request_redraw(self, keep_view: bool = True) -> None:
+    def _request_redraw(self, keep_view: bool = True, trailing: bool = False) -> None:
         """Programa un redibujo de la figura (se agrupan peticiones seguidas).
 
         Parameters
         ----------
         keep_view : bool
             Si es True se conserva el zoom actual (misma pista).
+        trailing : bool
+            Si es True (cambios de selección) cada petición nueva POSPONE el
+            redibujo: al recorrer la tabla con ↓ mantenida solo se redibuja al
+            soltar. La espera crece con lo que tardó el último dibujo (pistas
+            largas: hasta :data:`SELECTION_REDRAW_MAX_MS`).
         """
         # Mientras haya un redibujo pendiente solo se conserva el zoom si TODAS las
         # peticiones lo permiten (p. ej. un análisis nuevo con la pestaña oculta lo anula).
         self._keep_view = (self._keep_view and keep_view) if self._dirty else keep_view
         self._dirty = True
+        delay = REDRAW_DELAY_MS
+        if trailing:
+            delay = int(min(SELECTION_REDRAW_MAX_MS, max(REDRAW_DELAY_MS, self._last_draw_ms)))
+            if self._redraw_job is not None:
+                self.after_cancel(self._redraw_job)
+                self._redraw_job = None
         if self._redraw_job is None:
-            self._redraw_job = self.after(REDRAW_DELAY_MS, self._redraw)
+            self._redraw_job = self.after(delay, self._redraw)
 
     def _redraw(self) -> None:
         """Redibuja la figura si la pestaña está visible (si no, queda pendiente)."""
@@ -1210,11 +1261,12 @@ class AudioTab(ttk.Frame):
         if saved is not None and self._home_view is not None and self._same_view(saved, self._home_view):
             saved = None  # el usuario no había hecho zoom: no hay nada que restaurar
         selected = self._valid_position(self.app.state.selected_position)
-        self.plot.show(plots.plot_audio_overview, analysis, selected=selected)
-        self._clip_texts_to_axes()
+        # En lienzos bajos (ventanas de 1024×700) la figura se dibuja compacta: sin subtítulo
+        # (sus datos están en el panel de información) y con etiquetas cortas.
         self.compact = self._canvas_height() < COMPACT_HEIGHT_PX
-        if self.compact:
-            self._make_compact()
+        started = time.perf_counter()
+        self.plot.show(plots.plot_audio_overview, analysis, selected=selected, compact=self.compact)
+        self._last_draw_ms = 1000.0 * (time.perf_counter() - started)
         self.plot_state = "analysis"
         self.drawn_selection = selected
         self._home_view = self._current_view()
@@ -1226,49 +1278,50 @@ class AudioTab(ttk.Frame):
             self._apply_view(saved)
             if toolbar is not None:
                 toolbar.push_current()
+        if self._zoom_selection_pending:
+            self._zoom_selection_pending = False
+            if selected is not None and not self._segment_in_view(selected):
+                self._zoom_to(selected)
+        self.plot.draw()
+
+    def _segment_window(self, position: int) -> tuple[float, float] | None:
+        """Intervalo (s) ``[inicio − margen, fin + margen]`` del segmento ``position``, dentro de la pista."""
+        analysis = self.analysis
+        if analysis is None or not 0 <= position < len(analysis.kept):
+            return None
+        segment = analysis.kept[position]
+        return (max(0.0, segment.start_s - ZOOM_MARGIN_S), min(analysis.duration_s, segment.end_s + ZOOM_MARGIN_S))
+
+    def _segment_in_view(self, position: int) -> bool:
+        """True si la vista actual ya muestra el segmento con detalle (zoom de ≤ 3 veces su ventana)."""
+        window, view = self._segment_window(position), self._current_view()
+        if window is None or view is None:
+            return False
+        (left, right), (lo, hi) = view[0], window
+        return left <= lo and hi <= right and (right - left) <= 3.0 * (hi - lo)
+
+    def _zoom_to(self, position: int) -> None:
+        """Acerca el eje de tiempo al segmento ``position`` (la barra de matplotlib lo guarda: «atrás» vuelve)."""
+        window = self._segment_window(position)
+        axes = self._data_axes()
+        if window is None or not axes:
+            return
+        axes[0].set_xlim(*window)  # eje x compartido: también el espectrograma
+        if self.plot.toolbar is not None:
+            self.plot.toolbar.push_current()
+
+    def zoom_to_selection(self) -> None:
+        """Botón «Acercar a la nota»: acerca la figura al segmento seleccionado (±:data:`ZOOM_MARGIN_S` s)."""
+        position = self._valid_position(self.app.state.selected_position)
+        if position is None or self.plot_state != "analysis":
+            self.app.status.set_message("Selecciona un segmento (clic en la figura o en la tabla) para acercarte a él.")
+            return
+        self._zoom_to(position)
         self.plot.draw()
 
     def _canvas_height(self) -> int:
         """Altura actual del lienzo de matplotlib en píxeles."""
         return int(self.plot.canvas.get_tk_widget().winfo_height())
-
-    def _make_compact(self) -> None:
-        """Ahorra espacio vertical cuando la figura es baja (ventanas pequeñas).
-
-        Quita el subtítulo (archivo, duración, onsets y segmentos ya están en el
-        panel de información) y acorta las etiquetas de los ejes Y: una etiqueta
-        vertical más alta que su eje hace que *constrained layout* colapse los paneles.
-        """
-        fig = self.plot.figure
-        suptitle = getattr(fig, "_suptitle", None)
-        if suptitle is not None:
-            # plot_audio_overview reserva líneas en blanco bajo el título para el subtítulo.
-            suptitle.set_text(suptitle.get_text().rstrip("\n"))
-        for artist in list(fig.artists):
-            if isinstance(artist, Annotation):
-                artist.remove()
-        axes = self._data_axes()
-        if len(axes) >= 2:
-            axes[0].set_ylabel("Amplitud")
-            axes[1].set_ylabel("Hz (log)")
-            self._thin_note_ticks(axes[1])
-        for ax in fig.axes:
-            colorbar = getattr(ax, "_colorbar", None)
-            if colorbar is not None:
-                colorbar.set_label("dB", color=plots.TEXT_SECONDARY, fontsize=plots.LABEL_SIZE - 1)
-
-    @staticmethod
-    def _thin_note_ticks(ax: Any) -> None:
-        """Deja solo las marcas E1 y G2…G5 del eje de notas (las demás se solapan si el eje es bajo)."""
-        locator, formatter = ax.yaxis.get_major_locator(), ax.yaxis.get_major_formatter()
-        if not isinstance(locator, FixedLocator) or not isinstance(formatter, FixedFormatter):
-            return
-        locs = list(locator.locs)
-        labels = [formatter(value, i) for i, value in enumerate(locs)]
-        keep = [(v, text) for v, text in zip(locs, labels, strict=True) if text.split(" ")[0] in COMPACT_NOTE_TICKS]
-        if keep:
-            ax.yaxis.set_major_locator(FixedLocator([v for v, _t in keep]))
-            ax.yaxis.set_major_formatter(FixedFormatter([t for _v, t in keep]))
 
     def _on_canvas_configure(self, event: tk.Event) -> None:
         """Al cambiar el tamaño del lienzo redibuja lo que dependa de él.
@@ -1283,17 +1336,6 @@ class AudioTab(ttk.Frame):
                 self._request_redraw(keep_view=False)
         elif (event.height < COMPACT_HEIGHT_PX) != self.compact:
             self._request_redraw(keep_view=True)
-
-    def _clip_texts_to_axes(self) -> None:
-        """Recorta a su eje los textos de la figura (números de segmento sobre la onda).
-
-        Sin esto, al hacer zoom los números de los segmentos que quedan fuera
-        de la vista se dibujan a los lados de los ejes.
-        """
-        for ax in self._data_axes():
-            for text in ax.texts:
-                text.set_clip_box(ax.bbox)
-                text.set_clip_on(True)
 
     def _draw_empty_state(self) -> None:
         """Mensaje guía grande en la figura antes de analizar ningún audio.

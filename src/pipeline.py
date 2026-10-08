@@ -47,13 +47,20 @@ Demucs (si falta, :class:`src.separation.SeparationError` con instrucciones).
   ``y_raw`` pasa a ser la señal separada y ``source_path`` sigue siendo el
   archivo original (no hay otro archivo que señalar).
 
+Por eso ``source_path`` no basta para saber si se separó: el método que se
+usó de verdad queda en ``AnalysisResult.separation_method`` (``"demucs"``,
+``"hpss"`` o None). Con ``"auto"``, si el proceso de Demucs no logra importar
+PyTorch (p. ej. un torch roto en Windows: ``WinError 126``), se avisa y se
+recurre a HPSS en lugar de fallar.
+
 Progreso y cancelación
 ----------------------
 Cada etapa informa ``progress(fracción, mensaje)`` con fracciones ponderadas
 por su coste aproximado (pYIN y Demucs son las más lentas) y, ANTES de cada
 etapa, se consulta ``cancel``: si está activo se lanza
 :class:`src.config.CancelledError`. Las etapas no se interrumpen a la mitad
-(salvo Demucs, que vigila ``cancel`` por su cuenta).
+(salvo Demucs, que vigila ``cancel`` por su cuenta, y pYIN, que en pistas
+largas va por bloques y lo consulta entre bloque y bloque).
 
 :func:`rebuild_segment_data` permite cambiar los parámetros del entorno (k, N,
 β, tolerancia, tipo de espectro...) y obtener nuevos problemas bandit sin
@@ -150,6 +157,10 @@ class AnalysisResult:
         Ground truth si existe ``.gt.json`` junto al audio.
     config : Config
         Copia de la configuración usada.
+    separation_method : str | None
+        Separación que se aplicó DE VERDAD: ``"demucs"``, ``"hpss"`` o None
+        (sin separar). Con ``audio.separation_method = "auto"`` es el método
+        resuelto (HPSS si Demucs no está instalado o no pudo importarse).
 
     Examples
     --------
@@ -172,6 +183,7 @@ class AnalysisResult:
     segment_data: list[SegmentBanditData]
     ground_truth: list[GTNote] | None
     config: Config = field(default_factory=Config)
+    separation_method: str | None = None
 
     @property
     def kept(self) -> list[Segment]:
@@ -392,10 +404,23 @@ def analyze(
         how = "elegido" if cfg.audio.separation_method == "demucs" else "automático: Demucs está instalado"
         rep.begin("separation", f"Etapa 2/6 — Separación: aislando el bajo con Demucs "
                                 f"({cfg.audio.demucs_model}; método {how})")
-        source_path = separation.separate_bass(
-            path, model=cfg.audio.demucs_model, progress=rep.sub_progress("separation"), cancel=cancel)
-        logger.info("Separación: se analizará el stem de bajo %s", source_path.name)
-        y_raw, sr = io_audio.load_audio(source_path, sr=sr)
+        try:
+            source_path = separation.separate_bass(
+                path, model=cfg.audio.demucs_model, progress=rep.sub_progress("separation"), cancel=cancel)
+        except separation.SeparationDepsError as exc:
+            if cfg.audio.separation_method != "auto":
+                raise
+            # «auto» eligió Demucs porque torch/demucs están instalados, pero no se
+            # pueden importar (instalación rota): se usa HPSS en lugar de fallar.
+            logger.warning("Demucs está instalado pero no se pudo usar (%s); se separa con HPSS.",
+                           str(exc).split("\n", 1)[0])
+            rep.report("separation", 1.0, "Etapa 2/6 — Separación: Demucs no se pudo importar; aproximando el bajo "
+                                          "con HPSS (componente armónica + pasa-bajas)")
+            method = "hpss"
+            y_raw = separation.hpss_bass(y_raw, sr)
+        else:
+            logger.info("Separación: se analizará el stem de bajo %s", source_path.name)
+            y_raw, sr = io_audio.load_audio(source_path, sr=sr)
     elif method == "hpss":
         how = ("elegido" if cfg.audio.separation_method == "hpss"
                else "automático: Demucs no está instalado (pip install demucs para mejor calidad)")
@@ -435,7 +460,10 @@ def analyze(
     # 5. Pitch: pYIN sobre toda la pista (mismo hop que la segmentación) y f0
     #    de cada segmento conservado (se ignora el ataque, igual que la recompensa).
     rep.begin("pitch", f"Etapa 5/6 — Pitch: pYIN entre {cfg.pitch.fmin_hz:.0f} y {cfg.pitch.fmax_hz:.0f} Hz")
-    pitch_track = estimate_pitch_track(pre.y_analysis, sr, cfg.pitch, hop_length=hop)
+    # En pistas largas pYIN va por bloques: informa el avance y consulta
+    # ``cancel`` entre ellos (y libera el GIL para que la GUI siga viva).
+    pitch_track = estimate_pitch_track(pre.y_analysis, sr, cfg.pitch, hop_length=hop,
+                                       progress=rep.sub_progress("pitch"), cancel=cancel)
     annotate_segments(pitch_track, segments, cfg.pitch, attack_skip_s=cfg.env.attack_skip_s)
 
     # 6. Espectro (sin filtrar) y matriz de saliencia de cada segmento.
@@ -468,6 +496,7 @@ def analyze(
         segment_data=segment_data,
         ground_truth=ground_truth,
         config=cfg,
+        separation_method=method,
     )
 
 

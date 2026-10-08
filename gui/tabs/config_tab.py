@@ -73,8 +73,8 @@ from matplotlib.mathtext import MathTextParser
 
 from gui.widgets import UI_ACCENT, UI_ERROR, UI_SURFACE, UI_TEXT, UI_TEXT_SECONDARY, ParamField, ScrollableFrame, Tooltip, show_error
 from src.config import ALGO_COLORS, ALGO_LABELS, ALGORITHMS, PARAM_SPECS, Config
-from src.experiments import SWEEP_SPECS, estimate_experiment_seconds
-from src.plots import GRID, TEXT_MUTED
+from src.experiments import SWEEP_MAX_SEGMENTS, SWEEP_SPECS, effective_sweep_runs, estimate_experiment_seconds
+from src.plots import GRID
 
 logger = logging.getLogger(__name__)
 
@@ -280,11 +280,14 @@ class _Section:
 #: un subgrupo «Otros parámetros» de la sección de su prefijo.
 SECTIONS: tuple[_Section, ...] = (
     _Section(
-        "analysis", "Preprocesamiento, segmentación y pitch (requieren re-analizar)",
+        "analysis", "Separación, preprocesamiento, segmentación y pitch (requieren re-analizar)",
         ("audio", "preprocess", "segmentation", "pitch"),
-        "Etapas 3–5: se aplican volviendo a analizar el audio (filtrar, detectar onsets y estimar la f0 con "
-        "pYIN). Excepción: «Fracción con voz mínima» solo requiere re-transcribir.",
+        "Etapas 2–5: se aplican volviendo a analizar el audio (separar el bajo de una mezcla, filtrar, "
+        "detectar onsets y estimar la f0 con pYIN). Excepción: «Fracción con voz mínima» solo requiere "
+        "re-transcribir.",
         (
+            _Group("Separación del bajo (etapa 2; solo con «Separar bajo de mezcla» en la pestaña Audio)",
+                   ("audio.separation_method",)),
             _Group("Preprocesamiento: pasa-bajas (solo para onsets y pYIN)",
                    ("preprocess.lowpass_hz", "preprocess.filter_order")),
             _Group("Segmentación por onsets",
@@ -353,9 +356,6 @@ _BANNER_COLORS: dict[str, tuple[str, str, str]] = {
     "ok": ("#e7f4ec", "#1baf7a", "#174d33"),
     "error": ("#fbeaea", UI_ERROR, "#7a1b1b"),
 }
-
-#: Color del texto de un control desactivado (el gris de las marcas de los ejes de src.plots).
-_DISABLED_TEXT = TEXT_MUTED
 
 #: Color de la etiqueta de un parámetro cambiado que aún no se aplicó al análisis.
 _PENDING_TEXT = "#b25d00"
@@ -901,40 +901,19 @@ class ConfigTab(ttk.Frame):
         ParamField
             El control creado.
         """
-        field = ParamField(parent, key, PARAM_SPECS[key], self.app.state.config.get(key), on_change=self._on_param_change)
-        # Etiquetas y unidades con el ancho que necesita la sección (ParamField usa
-        # 26 y 4 caracteres fijos, que cortarían «Prob. de cambio voz/sin voz (pYIN)»
-        # o «muestras»).
-        field.label.configure(width=widths[0])
-        field.unit.configure(width=widths[1])
+        # Etiquetas y unidades con el ancho que necesita la sección (el valor por defecto de
+        # ParamField, 26 y 4 caracteres, cortaría «Prob. de cambio voz/sin voz (pYIN)» o
+        # «muestras»). La rueda del ratón sobre un control desplaza la página sin cambiar
+        # el valor (lo hace ParamField).
+        field = ParamField(parent, key, PARAM_SPECS[key], self.app.state.config.get(key),
+                           on_change=self._on_param_change, label_width=widths[0], unit_width=widths[1])
         kind = PARAM_SPECS[key].kind
         if kind == "float_list":
             field.control.configure(width=26)
         elif kind in ("int", "float", "int_or_none"):
             field.control.configure(width=10)
-        self._guard_wheel(field.control)
         self.fields[key] = field
         return field
-
-    def _guard_wheel(self, widget: tk.Widget) -> None:
-        """Hace que la rueda del ratón desplace la página en vez de cambiar el valor del control.
-
-        Los ``Spinbox`` y ``Combobox`` de ttk cambian su valor con la rueda: en
-        un formulario desplazable, eso modificaría parámetros sin querer.
-        """
-        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
-            widget.bind(sequence, self._scroll_page)
-
-    def _scroll_page(self, event: tk.Event) -> str:
-        """Desplaza la lista de parámetros y corta la acción por defecto del control."""
-        if getattr(event, "num", None) == 4:
-            delta = -1
-        elif getattr(event, "num", None) == 5:
-            delta = 1
-        else:
-            delta = -1 if getattr(event, "delta", 0) > 0 else 1
-        self.scroller.canvas.yview_scroll(delta, "units")
-        return "break"
 
     # ---------------------------------------------------------- algoritmos
     def _build_algorithms(self, parent: tk.Widget) -> None:
@@ -1125,8 +1104,7 @@ class ConfigTab(ttk.Frame):
             if message.startswith(key):
                 message = message[len(key):].lstrip(" :")
                 message = message[:1].upper() + message[1:]
-            # ParamField no expone un método público para mostrar errores externos.
-            self.fields[key]._show_error(message)
+            self.fields[key].show_error(message)
             logger.warning("Valor rechazado para %s: %s", key, "; ".join(new))
             return
         logger.info("Configuración: %s = %s", key, format_value(key, value))
@@ -1321,11 +1299,12 @@ class ConfigTab(ttk.Frame):
         self.pending_keys = set(reanalyze) | set(retranscribe)
         for key, field in self.fields.items():
             on = enabled.get(key, True)
-            if key in enabled:
-                field.control.state(["!disabled"] if on else ["disabled"])
+            if on != field.enabled:
+                field.set_enabled(on)  # control deshabilitado y etiqueta atenuada
             pending = on and key in self.pending_keys
-            field.label.configure(foreground=_DISABLED_TEXT if not on else _PENDING_TEXT if pending else UI_TEXT,
-                                  font=self._bold_font if pending else "TkDefaultFont")
+            if on:
+                field.label.configure(foreground=_PENDING_TEXT if pending else UI_TEXT)
+            field.label.configure(font=self._bold_font if pending else "TkDefaultFont")
 
     def _update_status(self) -> None:
         """Actualiza el aviso principal (sin audio / re-analizar / re-transcribir / al día)."""
@@ -1417,6 +1396,12 @@ class ConfigTab(ttk.Frame):
                             f"λ {format_seconds(est['lambda'])}).")
                 if cfg.experiment.run_lambda_sweep and not with_gt:
                     estimate += " El barrido de λ se omitirá: este audio no tiene ground truth (.gt.json)."
+                sweeps_on = cfg.experiment.run_sweeps or (cfg.experiment.run_lambda_sweep and with_gt)
+                runs = effective_sweep_runs(cfg, n_segments)
+                if sweeps_on and runs < int(cfg.experiment.sweep_runs):
+                    # Lo mismo que dirá la pestaña Comparación: en pistas largas se reducen las corridas.
+                    estimate += (f" Barridos: se usarán {runs} corridas por valor (no {cfg.experiment.sweep_runs}) "
+                                 f"porque la pista tiene {n_segments} notas (más de {SWEEP_MAX_SEGMENTS}).")
         self.estimate_label.configure(text=estimate)
 
         result = state.experiment

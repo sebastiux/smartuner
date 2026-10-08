@@ -373,10 +373,10 @@ def test_descartados_en_gris_y_no_seleccionables(tab: Any, analysis: Any) -> Non
     assert all("discarded" in tab.tree.item(r, "tags") for r in discarded)
     assert tab.tree.item(discarded[0], "values")[0] == "–"
     assert tab.info_values["segments"].cget("text") == "16 conservados · 2 descartados (1 por silencio, 1 por corto)"
-    assert "silencio" in tab._tree_help("row", discarded[0])
-    assert "corto" in tab._tree_help("row", discarded[1])
-    assert tab._tree_help("row", "pos0") == ""
-    assert "pYIN" in tab._tree_help("heading", "f0")
+    assert "silencio" in tab._tree_help(("row", discarded[0]))
+    assert "corto" in tab._tree_help(("row", discarded[1]))
+    assert tab._tree_help(("row", "pos0")) == ""
+    assert "pYIN" in tab._tree_help(("heading", "f0"))
 
     # Clic de ratón sobre una fila descartada: no cambia la selección.
     app.state.select_segment(4, source="test")
@@ -424,10 +424,22 @@ def test_audio_sin_notas_y_stem_de_demucs(tab: Any, analysis: Any) -> None:
     assert tab.plot_state == "analysis"
 
     stem = Path("cache") / "separated" / "linea_simple_bass.wav"
-    publish(app, dataclasses.replace(analysis, source_path=stem))
+    publish(app, dataclasses.replace(analysis, source_path=stem, separation_method="demucs"))
     assert tab.info_values["source"].cget("text") == "linea_simple_bass.wav (stem de bajo de Demucs)"
     assert tab._source_help() == str(stem)
     assert tab.empty_table.winfo_manager() == ""
+
+
+def test_senal_analizada_distingue_hpss_de_sin_separar(tab: Any, analysis: Any) -> None:
+    """Regresión: con HPSS (source_path == path) el panel ya no dice «sin separar»; la ayuda menciona HPSS."""
+    app = tab.app
+    publish(app, dataclasses.replace(analysis, separation_method="hpss"))
+    assert tab.info_values["source"].cget("text") == "el archivo original, separado con HPSS + pasa-bajas (en memoria)"
+    publish(app, dataclasses.replace(analysis, separation_method=None))
+    assert tab.info_values["source"].cget("text") == "el archivo original (sin separar)"
+    from gui.tabs.audio_tab import INFO_FIELDS
+
+    assert "HPSS" in dict((key, help_text) for key, _label, help_text in INFO_FIELDS)["source"]
 
 
 def test_tolerancia_de_onset_cambia_el_emparejamiento(tab: Any) -> None:
@@ -536,9 +548,73 @@ def test_ventana_pequena_usa_modo_compacto(tab: Any) -> None:
             assert not any(isinstance(a, Annotation) for a in fig.artists)
             assert tab._data_axes()[1].get_ylabel() == "Hz (log)"
         else:  # lienzo suficientemente alto en este servidor X: al menos debe poder compactarse
-            tab._make_compact()
+            from src import plots
+
+            plots.plot_audio_overview(app.state.analysis, fig=tab.plot.figure, compact=True)
             assert tab._data_axes()[1].get_ylabel() == "Hz (log)"
     finally:
         app.root.geometry("1360x880+0+0")
         pump(app, 0.3)
         settle(tab)
+
+
+def test_columna_gt_visible_si_el_analisis_termina_en_otra_pestana(tab: Any, analysis: Any) -> None:
+    """Regresión: con el análisis publicado mientras se ve otra pestaña, al volver a Audio la columna «Real (GT)»
+    sigue dentro de la tabla (antes los anchos se calculaban con la pestaña oculta y sumaban más que la tabla)."""
+    app = tab.app
+    publish(app, dataclasses.replace(analysis, ground_truth=None))  # sin GT: columna oculta
+    app.show_tab("tab")
+    pump(app, 0.2)
+    app.state.analysis = analysis
+    app.state.events.emit("analysis_ready", analysis=analysis)  # con GT, con la pestaña Audio oculta
+    pump(app, 0.2)
+    app.show_tab("audio")
+    settle(tab)
+    pump(app, 0.2)
+    tree = tab.tree
+    columns = list(tree.cget("displaycolumns"))
+    assert columns[-1] == "gt"
+    total = sum(int(tree.column(c, "width")) for c in columns)
+    assert total <= tree.winfo_width()
+    first = tree.get_children()[0]
+    x, _y, width, _h = tree.bbox(first, "gt")
+    assert width > 40 and x + width <= tree.winfo_width()
+    # Y al estrechar la ventana, las columnas se reparten de nuevo.
+    app.root.geometry("1100x800+0+0")
+    pump(app, 0.4)
+    assert sum(int(tree.column(c, "width")) for c in columns) <= tree.winfo_width()
+    app.root.geometry("1360x880+0+0")
+    pump(app, 0.3)
+
+
+def test_seleccion_externa_acerca_la_figura_en_pistas_largas(tab: Any, analysis: Any,
+                                                             monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regresión (Money, 381 s): una nota elegida en otra pestaña ya no es una línea de un píxel: la figura se
+    acerca a [inicio − 2 s, fin + 2 s]; «Inicio» vuelve a la pista completa y «Acercar a la nota» se acerca otra vez."""
+    import gui.tabs.audio_tab as audio_tab
+
+    app = tab.app
+    publish(app, analysis)
+    # linea_simple dura ~11 s: con estos valores cuenta como «larga» y la ventana es mucho menor que la pista.
+    monkeypatch.setattr(audio_tab, "ZOOM_LONG_TRACK_S", 1.0)
+    monkeypatch.setattr(audio_tab, "ZOOM_MARGIN_S", 0.5)
+    segment = analysis.kept[5]
+    expected = (max(0.0, segment.start_s - audio_tab.ZOOM_MARGIN_S),
+                min(analysis.duration_s, segment.end_s + audio_tab.ZOOM_MARGIN_S))
+    app.state.select_segment(5, source="tab")
+    settle(tab)
+    np.testing.assert_allclose(tab._data_axes()[0].get_xlim(), expected)
+    assert tab.btn_zoom_note.instate(["!disabled"])
+    tab.plot.toolbar.home()
+    full = tab._data_axes()[0].get_xlim()
+    assert full[1] - full[0] > analysis.duration_s * 0.9
+    tab.zoom_to_selection()
+    np.testing.assert_allclose(tab._data_axes()[0].get_xlim(), expected)
+    # Selección hecha en la propia pestaña Audio (clic en la figura o en la tabla): no se mueve la vista.
+    tab.plot.toolbar.home()
+    app.state.select_segment(2, source="audio")
+    settle(tab)
+    view = tab._data_axes()[0].get_xlim()
+    assert view[1] - view[0] > analysis.duration_s * 0.9
+    app.state.select_segment(None, source="test")
+    settle(tab)

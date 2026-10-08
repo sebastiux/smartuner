@@ -15,7 +15,9 @@ ground truth mediante :func:`src.experiments.match_segments_to_gt` y
 Contenido::
 
     ┌ Algoritmo (●) ε-greedy (○) Optimista (○) UCB1 (○) Softmax   ☑ Comparar con ground truth
-    ├ Zoom [−] ──●── [+] 160 px/s [Ajustar]  ☐ Vista ASCII        Exportar: [TXT] [JSON] [CSV] [Exportar las 4…]
+    ├ Zoom [−] ──●── [+] 160 px/s [Ajustar]  ☐ Vista ASCII  Exportar: [TXT] [JSON] [CSV] [MID] [Exportar las 4…]
+    ├ Escuchar: [▶ Reproducir] [■] 0:12.3 / 6:21.0 ☑ Seguir │ Modo (●) MIDI (○) Original (○) Mezcla
+    │           (○) A/B estéreo │ Síntesis [Automática ▾]       (en ventanas estrechas, en dos líneas)
     ├ Aviso (solo si cambió la configuración del entorno o de los agentes: [Re-transcribir])
     ├ Resumen: «UCB1 · 16 notas · pitch 16/16 (100 %) · posición 12/16 (75 %)»     leyenda ✓ ~ ✗ + ⬚
     ├ Tablatura gráfica (desplazamiento horizontal)          ─ o ─  Vista ASCII (texto monoespaciado)
@@ -44,6 +46,20 @@ solo del color):
 En la pauta del ground truth, las notas reales sin segmento («no detectadas»)
 se dibujan con borde discontinuo.
 
+Escuchar la tablatura
+---------------------
+La fila «Escuchar» reproduce la tablatura del algoritmo mostrado como MIDI
+sintetizado (:class:`gui.playback.TabPlayback`; síntesis en segundo plano la
+primera vez, después en caché): sola (MIDI), el original, ambos mezclados o en
+A/B estéreo (original a la izquierda, MIDI a la derecha). Un cursor verde
+recorre la tablatura y la nota que suena se rodea en verde; con «Seguir» la
+vista avanza por páginas. Clic en la regla de tiempo: escuchar desde ahí;
+espacio: ▶/⏸. Cambiar de modo o de algoritmo mientras suena continúa desde el
+mismo instante (comparación de oído). Solo suena un reproductor a la vez: antes
+de reproducir se reclama la salida de audio
+(:meth:`gui.app.SmartunerApp.claim_audio_output`) y la pestaña Audio se
+detiene; si la pestaña Audio reproduce, esta se pausa.
+
 Sincronización con las demás pestañas
 -------------------------------------
 * ``analysis_ready`` / ``transcriptions_ready`` → redibuja (los dos eventos
@@ -58,6 +74,7 @@ Sincronización con las demás pestañas
   onset y muestra el aviso «re-transcribir» si cambiaron el entorno, los
   agentes o la semilla.
 * ``busy_changed`` → deshabilita la exportación mientras hay una tarea en curso.
+* ``audio_output_claimed`` → otra pestaña va a reproducir: pausa la tablatura.
 
 La gráfica del espectro (≈ 0.1–0.3 s) se dibuja de forma diferida (agrupa
 selecciones rápidas, p. ej. al recorrer las notas con ← y →) y solo cuando la
@@ -80,7 +97,8 @@ import numpy as np
 from matplotlib.figure import Figure
 from matplotlib.text import Annotation
 
-from gui.widgets import UI_ACCENT, PlotFrame, Tooltip, show_error
+from gui.playback import TabPlayback
+from gui.widgets import UI_ACCENT, HoverTooltip, PlotFrame, Tooltip, show_error, tree_heading_at
 from src import plots
 from src.config import ALGO_COLORS, ALGO_LABELS, ALGORITHMS, RESULTS_DIR
 from src.environment import Arm
@@ -94,7 +112,7 @@ from src.experiments import (
     score_arms,
 )
 from src.pitch import midi_to_name
-from src.tab import TAB_STRINGS, TabNote, export_tab, render_ascii
+from src.tab import PLAYBACK_MODE_LABELS, PLAYBACK_MODES, TAB_STRINGS, TabNote, export_tab, render_ascii
 
 if TYPE_CHECKING:  # solo para las anotaciones de tipo (evita importes circulares)
     from gui.app import SmartunerApp
@@ -127,6 +145,15 @@ OUTCOME_TEXT: dict[int, str] = {
     OUTCOME_WRONG_PITCH: "Pitch incorrecto",
     OUTCOME_EXTRA: "Segmento sin nota real",
     OUTCOME_MISSED: "Nota real no detectada",
+}
+
+#: Versión corta de :data:`OUTCOME_TEXT` para la leyenda en ventanas bajas (≈ 1024×700).
+OUTCOME_SHORT_TEXT: dict[int, str] = {
+    OUTCOME_EXACT: "Exacta",
+    OUTCOME_WRONG_POSITION: "Otra posición",
+    OUTCOME_WRONG_PITCH: "Pitch erróneo",
+    OUTCOME_EXTRA: "Sin nota real",
+    OUTCOME_MISSED: "No detectada",
 }
 
 #: Color de relleno de cada estado (los de :data:`src.plots.OUTCOME_COLORS`; el segmento de más usa
@@ -179,12 +206,18 @@ GUTTER_W = 64
 #: Altura (px) de la pestaña por debajo de la cual se usa la geometría compacta.
 COMPACT_TAB_HEIGHT = 650
 
+#: Alto mínimo (px) que pide el cuerpo del panel inferior (normal y compacto); luego se estira.
+DETAIL_MIN_HEIGHT = 150
+DETAIL_MIN_HEIGHT_COMPACT = 110
+
 #: Ancho (px) del panel inferior por debajo del cual la tabla de brazos oculta la columna «Nota».
 NARROW_DETAIL_PX = 1100
 
 #: Alto mínimo (pulgadas) de la figura del espectro para mostrar su título y su subtítulo.
 SPECTRUM_TITLE_MIN_IN = 2.6
 SPECTRUM_SUBTITLE_MIN_IN = 3.8
+#: Por debajo de este alto (pulgadas) se omite la etiqueta del eje x (las marcas en Hz bastan).
+SPECTRUM_XLABEL_MIN_IN = 1.6
 
 #: Fracción máxima de la altura de la pestaña que ocupa la vista ASCII.
 ASCII_MAX_FRACTION = 0.45
@@ -200,7 +233,37 @@ BANNER_BG = "#fdf3d8"
 BANNER_FG = "#5c4400"
 
 #: Formatos de exportación: extensión → nombre legible.
-EXPORT_FORMATS: dict[str, str] = {"txt": "Texto (TXT)", "json": "JSON", "csv": "CSV"}
+EXPORT_FORMATS: dict[str, str] = {"txt": "Texto (TXT)", "json": "JSON", "csv": "CSV", "mid": "MIDI"}
+
+#: Color del cursor de reproducción y del contorno de la nota que suena (verde: distinto del
+#: azul de la selección y de los colores de los algoritmos).
+PLAY_COLOR = "#2f9e44"
+#: Con «Seguir» activo, cuando el cursor pasa de esta fracción del ancho visible la vista
+#: avanza una página (como en un editor de audio), dejando el cursor cerca del borde izquierdo.
+FOLLOW_MARGIN = 0.85
+#: Fracción del ancho visible que queda a la izquierda del cursor tras avanzar una página.
+FOLLOW_LEAD = 0.08
+#: Segundos que se escuchan ANTES de la nota seleccionada al pulsar ▶ (contexto).
+PLAY_PREROLL_S = 1.0
+
+#: Nombre legible de cada sintetizador (lista «Síntesis»).
+SYNTH_LABELS: dict[str, str] = {
+    "auto": "Automática",
+    "fluidsynth": "FluidSynth",
+    "karplus-strong": "Karplus-Strong",
+}
+
+#: Explicación de cada modo de escucha (tooltips de sus botones de radio).
+PLAYBACK_MODE_HELP: dict[str, str] = {
+    "midi": "Solo la tablatura sintetizada: lo que el algoritmo «cree» que suena (sus notas MIDI con los "
+            "tiempos de los segmentos).",
+    "original": "Solo el audio original analizado, con el cursor sobre la tablatura: para seguir la pista nota "
+                "a nota.",
+    "mezcla": "Original y síntesis a la vez: si una nota se eligió con el pitch equivocado, se oye desafinar "
+              "contra el original.",
+    "estereo": "A/B estéreo: original por el canal izquierdo y síntesis por el derecho. Con auriculares se "
+               "comparan las dos versiones nota a nota.",
+}
 
 #: Explicación breve de cada algoritmo (tooltips de los botones de radio).
 ALGO_HELP: dict[str, str] = {
@@ -245,7 +308,8 @@ EMPTY_TEXT = ("Abre un MP3 (Archivo → Abrir) o genera el dataset sintético. A
 NO_SELECTION_TEXT = ("Ninguna nota seleccionada. Haz clic en una nota de la tablatura (o usa ← y → sobre ella) "
                      "para ver su espectro, el template armónico del brazo elegido y los brazos candidatos.")
 #: Atajos de la tablatura gráfica (tooltip del lienzo y pista).
-CANVAS_HINT = "Clic en una nota: ver sus detalles · ← / →: nota anterior / siguiente · rueda: desplazar · Ctrl + rueda: zoom"
+CANVAS_HINT = ("Clic en una nota: ver sus detalles · ← / →: nota anterior / siguiente · rueda: desplazar · "
+               "Ctrl + rueda: zoom · clic en la regla: escuchar desde ahí · espacio: ▶/⏸")
 
 
 # ---------------------------------------------------------------------------
@@ -301,6 +365,29 @@ def format_seconds(t: float, step: float) -> str:
     """
     decimals = 0 if step >= 1 else 1 if math.isclose(step * 10, round(step * 10)) else 2
     return f"{t:.{decimals}f}"
+
+
+def format_clock(t: float) -> str:
+    """Instante en formato de reloj ``m:ss.d`` (minutos, segundos con una décima).
+
+    Parameters
+    ----------
+    t : float
+        Instante (s); los negativos se tratan como 0.
+
+    Returns
+    -------
+    str
+        p. ej. ``"6:21.0"``.
+
+    Examples
+    --------
+    >>> format_clock(0), format_clock(9.96), format_clock(381.04)
+    ('0:00.0', '0:10.0', '6:21.0')
+    """
+    tenths = int(round(max(0.0, float(t)) * 10))
+    minutes, tenths = divmod(tenths, 600)
+    return f"{minutes}:{tenths // 10:02d}.{tenths % 10}"
 
 
 def outcome_of_segments(n_segments: int, matches: list[int | None], outcomes: np.ndarray) -> list[int]:
@@ -482,6 +569,8 @@ def note_spectrum_figure(analysis: AnalysisResult, position: int, arm: Arm, gt_a
     for ax in fig.axes:
         if ax.get_ylabel():
             ax.yaxis.label.set_text("Magnitud (máx. = 1)" if height_in >= 3.0 else "Magnitud")
+        if height_in < SPECTRUM_XLABEL_MIN_IN and ax.get_xlabel():
+            ax.set_xlabel("")  # figura muy baja (≈ 1024×700): los ejes ganan el alto de la etiqueta
     hide_subtitle = height_in < SPECTRUM_SUBTITLE_MIN_IN
     hide_title = height_in < SPECTRUM_TITLE_MIN_IN
     for text in fig.texts:
@@ -640,83 +729,6 @@ def _round_rect(canvas: tk.Canvas, x0: float, y0: float, x1: float, y1: float, r
 
 
 # ---------------------------------------------------------------------------
-# Tooltip según la zona bajo el puntero
-# ---------------------------------------------------------------------------
-
-
-class _HoverTooltip(Tooltip):
-    """Tooltip cuyo texto depende de lo que hay bajo el ratón (una nota del lienzo, un encabezado).
-
-    Parameters
-    ----------
-    widget : tk.Widget
-        Widget al que se asocia.
-    key_for : Callable[[int, int], Hashable | None]
-        Función ``(x, y)`` (coordenadas del widget) → identificador de la zona
-        (None = nada que explicar).
-    text_for : Callable[[Hashable], str]
-        Texto para una zona.
-    """
-
-    def __init__(self, widget: tk.Widget, key_for: Callable[[int, int], Hashable | None],
-                 text_for: Callable[[Hashable], str]) -> None:
-        """Asocia el tooltip a ``widget`` y sigue el movimiento del ratón."""
-        self._key_for = key_for
-        self._text_for = text_for
-        self._hover: Hashable | None = None
-        super().__init__(widget, self._current_text, delay_ms=350, wraplength=360)
-        widget.bind("<Motion>", self._on_motion, add="+")
-
-    def hide(self) -> None:
-        """Oculta el tooltip (p. ej. al redibujar el lienzo: la nota bajo el puntero cambió)."""
-        self._hover = None
-        self._hide()
-
-    def _pointer_key(self) -> Hashable | None:
-        """Zona bajo el puntero (o None)."""
-        w = self.widget
-        try:
-            return self._key_for(w.winfo_pointerx() - w.winfo_rootx(), w.winfo_pointery() - w.winfo_rooty())
-        except tk.TclError:
-            return None
-
-    def _current_text(self) -> str:
-        """Texto de la zona actual (cadena vacía = no mostrar nada)."""
-        key = self._pointer_key()
-        return self._text_for(key) if key is not None else ""
-
-    def _on_motion(self, event: tk.Event) -> None:
-        """Reinicia la espera cuando el ratón pasa a otra zona."""
-        key = self._key_for(event.x, event.y)
-        if key != self._hover:
-            self._hover = key
-            self._hide()
-            if key is not None:
-                self._schedule()
-
-    def _show(self) -> None:
-        """Muestra el texto junto al puntero, sin salirse de la pantalla."""
-        text = self._current_text()
-        if not text or self._tip is not None:
-            return
-        w = self.widget
-        self._tip = tip = tk.Toplevel(w)
-        tip.withdraw()
-        tip.wm_overrideredirect(True)
-        tk.Label(tip, text=text, justify="left", wraplength=self.wraplength, background="#fffbe8",
-                 foreground=plots.TEXT_PRIMARY, relief="solid", borderwidth=1, padx=8, pady=6,
-                 font=("TkDefaultFont", 9)).pack()
-        tip.update_idletasks()
-        x = w.winfo_pointerx() + 14
-        y = w.winfo_pointery() + 18
-        if y + tip.winfo_reqheight() > w.winfo_screenheight():
-            y = w.winfo_pointery() - tip.winfo_reqheight() - 10
-        x = min(x, max(0, w.winfo_screenwidth() - tip.winfo_reqwidth() - 4))
-        tip.wm_geometry(f"+{x}+{y}")
-        tip.deiconify()
-
-
-# ---------------------------------------------------------------------------
 # Pestaña
 # ---------------------------------------------------------------------------
 
@@ -761,7 +773,14 @@ class TablatureTab(ttk.Frame):
     export_buttons : dict[str, ttk.Button]
         Botones de exportación por formato (``"txt"``, ``"json"``, ``"csv"``).
     export_all_menu : tk.Menu
-        Menú de «Exportar las 4…» (una entrada por formato y «los tres formatos»).
+        Menú de «Exportar las 4…» (una entrada por formato y «todos los formatos»).
+    playback : gui.playback.TabPlayback
+        Reproductor de la tablatura (MIDI sintetizado, original, mezcla o A/B
+        estéreo) con cursor sincronizado.
+    btn_play, btn_stop : ttk.Button
+        ▶/⏸ y ■ de la fila «Escuchar».
+    play_mode_var, synth_var, follow_var : tk.Variable
+        Modo de escucha, sintetizador (nombre legible) y casilla «Seguir».
     """
 
     def __init__(self, master: tk.Misc, app: SmartunerApp) -> None:
@@ -789,12 +808,22 @@ class TablatureTab(ttk.Frame):
         self._detail_job: str | None = None
         self._ascii_job: str | None = None
         self._detail_dirty = False
+        self._show_first_note = False   # tras un análisis NUEVO: llevar la vista a la primera nota
         self._ascii_width = 0
         self._swatches: dict[str, tk.PhotoImage] = {}
         self._wrapped_info: bool | None = None
         self._syncing_scale = False
         self._narrow_table = False
         self._canvas_height = 150
+        self._play_x: float | None = None          # x (lienzo) del cursor de reproducción dibujado
+        self._playing_pos: int | None = None       # nota que suena (contorno verde)
+        self._ruler_cursor = False                 # puntero «mano» sobre la regla
+
+        # Escuchar la tablatura: la síntesis corre como tarea de la aplicación (barra de
+        # progreso y «Cancelar»); el reproductor avisa la posición cada ~30 ms.
+        self.playback = TabPlayback(
+            self, self._run_synthesis, on_position=self._on_play_position, on_state=self._on_play_state,
+            on_finished=self._clear_play_marks, on_message=app.status.set_message)
 
         self._setup_fonts_and_styles()
         self.columnconfigure(0, weight=1)
@@ -812,7 +841,9 @@ class TablatureTab(ttk.Frame):
         events.subscribe("segment_selected", self._on_segment_selected)
         events.subscribe("config_changed", self._on_config_changed)
         events.subscribe("busy_changed", self._on_busy_changed)
+        events.subscribe("audio_output_claimed", self._on_audio_output_claimed)
         self.bind("<Map>", self._on_map, add="+")
+        self.bind("<Destroy>", self._on_destroy, add="+")
         self.bind("<Configure>", self._on_tab_configure, add="+")
 
         self.analysis = app.state.analysis
@@ -860,7 +891,7 @@ class TablatureTab(ttk.Frame):
         return self._swatches[color]
 
     def _build_toolbar(self) -> None:
-        """Dos filas de controles: algoritmo + comparación; zoom + vista + exportación."""
+        """Tres filas de controles: algoritmo + comparación; zoom + vista + exportación; escuchar."""
         bar = ttk.Frame(self)
         bar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
         bar.columnconfigure(0, weight=1)
@@ -940,6 +971,9 @@ class TablatureTab(ttk.Frame):
                     "posición, inicio/fin (s), cuerda, traste, MIDI, nombre de la nota y f0 de pYIN.",
             "csv": "Tabla CSV con una fila por nota: position, start_s, end_s, string, fret, midi, note, f0_hz "
                    "(se abre con una hoja de cálculo).",
+            "mid": "Archivo MIDI estándar (bajo eléctrico, programa GM 33) con una nota por segmento en su tiempo "
+                   "real: se abre en cualquier DAW o editor de partituras (MuseScore, Reaper, GarageBand…). Es lo "
+                   "mismo que suena con «Escuchar» en modo MIDI.",
         }
         for fmt in EXPORT_FORMATS:
             button = ttk.Button(right, text=fmt.upper(), style="TablaBar.TButton",
@@ -952,13 +986,99 @@ class TablatureTab(ttk.Frame):
         for fmt, name in EXPORT_FORMATS.items():
             self.export_all_menu.add_command(label=f"Como {name}…", command=lambda fmt=fmt: self.export_all((fmt,)))
         self.export_all_menu.add_separator()
-        self.export_all_menu.add_command(label="En los tres formatos…",
+        self.export_all_menu.add_command(label="En todos los formatos…",
                                          command=lambda: self.export_all(tuple(EXPORT_FORMATS)))
         self.export_all_button.configure(menu=self.export_all_menu)
         self.export_all_button.pack(side="left", padx=(4, 0))
         Tooltip(self.export_all_button, "Elige una carpeta y guarda la tablatura de los cuatro algoritmos, un archivo "
                                         "por algoritmo (<audio>_tab_<algoritmo>.<formato>), para compararlas o "
                                         "adjuntarlas al informe.")
+        self._build_listen_row(bar)
+
+    def _build_listen_row(self, bar: ttk.Frame) -> None:
+        """Tercera fila: escuchar la tablatura (▶/⏸, ■, tiempo, «Seguir»; modo y sintetizador).
+
+        Son dos grupos: el transporte y las opciones. Si no caben en una línea
+        (ventanas de ≈ 1024 px) las opciones pasan a una segunda línea.
+        """
+        row3 = ttk.Frame(bar)
+        row3.grid(row=2, column=0, sticky="ew", pady=(6, 0))
+        self.listen_row = row3
+        main = ttk.Frame(row3)
+        main.grid(row=0, column=0, sticky="w")
+        options = ttk.Frame(row3)
+        self.listen_options = options
+        self._listen_wrapped: bool | None = None
+
+        label = ttk.Label(main, text="Escuchar:", style="TablaKey.TLabel")
+        label.pack(side="left", padx=(0, 6))
+        Tooltip(label, "Reproduce la tablatura del algoritmo mostrado como MIDI sintetizado (cada nota en el tiempo de "
+                       "su segmento), sola o junto al audio original. Un cursor verde recorre la tablatura y la nota "
+                       "que suena se rodea en verde. Espacio: reproducir / pausar; clic en la regla de tiempo: "
+                       "escuchar desde ese instante.")
+        self.btn_play = ttk.Button(main, text="▶ Reproducir", style="TablaBar.TButton", width=13,
+                                   command=self.toggle_playback)
+        self.btn_play.pack(side="left")
+        Tooltip(self.btn_play, self._play_help)
+        self.btn_stop = ttk.Button(main, text="■", style="TablaBar.TButton", width=3, command=self.stop_playback)
+        self.btn_stop.pack(side="left", padx=(4, 0))
+        Tooltip(self.btn_stop, "Detener y volver al principio.")
+        self.play_time_label = ttk.Label(main, text="0:00.0 / 0:00.0", width=15, anchor="w",
+                                         style="TablaKey.TLabel")
+        self.play_time_label.pack(side="left", padx=(8, 0))
+        Tooltip(self.play_time_label, "Instante que suena / duración de la pista (minutos:segundos). El tiempo es el "
+                                      "del audio original: el mismo que la regla de la tablatura.")
+        self.follow_var = tk.BooleanVar(master=self, value=True)
+        self.chk_follow = ttk.Checkbutton(main, text="Seguir", variable=self.follow_var)
+        self.chk_follow.pack(side="left", padx=(2, 0))
+        Tooltip(self.chk_follow, "Desplaza la tablatura para que el cursor de reproducción siempre esté a la vista "
+                                 "(avanza una página cuando el cursor llega cerca del borde derecho). Desactívalo para "
+                                 "moverte libremente mientras suena.")
+
+        self._listen_sep = ttk.Separator(row3, orient="vertical")
+        mode_label = ttk.Label(options, text="Modo:", style="TablaKey.TLabel")
+        mode_label.pack(side="left", padx=(0, 4))
+        Tooltip(mode_label, "Qué se oye. Se puede cambiar mientras suena: continúa desde el mismo instante (ideal "
+                            "para comparar de oído en clase).")
+        self.play_mode_var = tk.StringVar(master=self, value=self.playback.mode)
+        self.mode_radios: dict[str, ttk.Radiobutton] = {}
+        for mode in PLAYBACK_MODES:
+            radio = ttk.Radiobutton(options, text=PLAYBACK_MODE_LABELS[mode], value=mode,
+                                    variable=self.play_mode_var, command=self._on_play_mode)
+            radio.pack(side="left", padx=(0, 8))
+            Tooltip(radio, PLAYBACK_MODE_HELP[mode])
+            self.mode_radios[mode] = radio
+        ttk.Separator(options, orient="vertical").pack(side="left", fill="y", padx=(4, 12), pady=2)
+        synth_label = ttk.Label(options, text="Síntesis:", style="TablaKey.TLabel")
+        synth_label.pack(side="left", padx=(0, 4))
+        methods = TabPlayback.available_methods()
+        self._synth_by_label = {SYNTH_LABELS.get(m, m): m for m in methods}
+        self.synth_var = tk.StringVar(master=self, value=SYNTH_LABELS.get(self.playback.method, self.playback.method))
+        self.synth_combo = ttk.Combobox(options, textvariable=self.synth_var, state="readonly", width=14,
+                                        values=list(self._synth_by_label))
+        self.synth_combo.pack(side="left")
+        self.synth_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_synth_method())
+        for widget in (synth_label, self.synth_combo):
+            Tooltip(widget, self._synth_help)
+        self._listen_main = main
+        row3.bind("<Configure>", lambda _e: self._layout_listen_row(), add="+")
+        self._layout_listen_row()
+
+    def _layout_listen_row(self) -> None:
+        """Pone las opciones de escucha a la derecha del transporte, o debajo si no caben."""
+        width = self.listen_row.winfo_width()
+        if width <= 1:
+            width = 1300
+        wrapped = self._listen_main.winfo_reqwidth() + self.listen_options.winfo_reqwidth() + 30 > width
+        if wrapped == self._listen_wrapped:
+            return
+        self._listen_wrapped = wrapped
+        if wrapped:
+            self._listen_sep.grid_remove()
+            self.listen_options.grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        else:
+            self._listen_sep.grid(row=0, column=1, sticky="ns", padx=(10, 12), pady=2)
+            self.listen_options.grid(row=0, column=2, columnspan=1, sticky="w", pady=0)
 
     def _build_banner(self) -> None:
         """Aviso (oculto por defecto) de que la configuración cambió después de transcribir."""
@@ -993,6 +1113,7 @@ class TablatureTab(ttk.Frame):
 
         legend = ttk.Frame(info)
         self.legend = legend
+        self._legend_labels: dict[int, ttk.Label] = {}
         background = ttk.Style(self).lookup("TFrame", "background") or plots.HIGHLIGHT
         for code in (OUTCOME_EXACT, OUTCOME_WRONG_POSITION, OUTCOME_WRONG_PITCH, OUTCOME_EXTRA, OUTCOME_MISSED):
             item = ttk.Frame(legend)
@@ -1007,6 +1128,7 @@ class TablatureTab(ttk.Frame):
                 swatch.create_text(9, 8, text=OUTCOME_SYMBOLS[code], fill=_ink_on(fill), font=self.font_badge)
             text = ttk.Label(item, text=OUTCOME_TEXT[code], style="TablaHint.TLabel")
             text.pack(side="left")
+            self._legend_labels[code] = text
             for widget in (swatch, text):
                 Tooltip(widget, OUTCOME_HELP[code])
         self.hint_label = ttk.Label(info, text=CANVAS_HINT, style="TablaHint.TLabel")
@@ -1052,7 +1174,13 @@ class TablatureTab(ttk.Frame):
         self.canvas.bind("<Home>", lambda _e: self._select_edge(first=True))
         self.canvas.bind("<End>", lambda _e: self._select_edge(first=False))
         self.canvas.bind("<Configure>", self._on_canvas_configure, add="+")
-        self._canvas_tip = _HoverTooltip(self.canvas, self._canvas_key, self._canvas_tooltip)
+        # Si el análisis terminó con la pestaña oculta, el lienzo aún no estaba mapeado cuando
+        # se pidió mostrar la primera nota: se reintenta cuando el lienzo aparece en pantalla.
+        self.canvas.bind("<Map>", self._on_canvas_map, add="+")
+        self.canvas.bind("<space>", self._on_space)
+        self.canvas.bind("<Button-1>", self._on_ruler_click, add="+")
+        self.canvas.bind("<Motion>", self._on_canvas_motion, add="+")
+        self._canvas_tip = HoverTooltip(self.canvas, self._canvas_key, self._canvas_tooltip)
 
         # Botones del estado vacío (se colocan dentro del lienzo con create_window).
         buttons = ttk.Frame(self.canvas)
@@ -1108,8 +1236,9 @@ class TablatureTab(ttk.Frame):
         # El cuerpo NO propaga el tamaño pedido de la figura y la tabla: así la pestaña nunca
         # pide más alto que la ventana (a 1024×700 la barra de estado quedaría fuera) y el
         # panel se encoge o crece con el espacio que dejan la barra y la tablatura.
-        body = ttk.Frame(frame, height=150, width=600)
+        body = ttk.Frame(frame, height=DETAIL_MIN_HEIGHT, width=600)
         body.grid(row=1, column=0, sticky="nsew")
+        self.detail_body = body
         body.grid_propagate(False)
         body.columnconfigure(0, weight=1, minsize=360)
         body.columnconfigure(1, weight=0)
@@ -1148,7 +1277,7 @@ class TablatureTab(ttk.Frame):
         tree_scroll = ttk.Scrollbar(table, orient="vertical", command=self.tree.yview)
         tree_scroll.grid(row=1, column=1, sticky="ns")
         self.tree.configure(yscrollcommand=tree_scroll.set)
-        _HoverTooltip(self.tree, self._tree_key, self._tree_tooltip)
+        HoverTooltip(self.tree, self._tree_key, self._tree_tooltip)
         self.table_legend = ttk.Label(table, style="TablaHint.TLabel", anchor="w", justify="left",
                                       text="Fondo azul: brazo elegido (el más jalado) · ★ óptimo = argmax μ · "
                                            "● real = posición del ground truth")
@@ -1254,6 +1383,24 @@ class TablatureTab(ttk.Frame):
         if self.ascii_var.get():
             self._render_ascii()
         self._update_detail()
+        self._sync_playback()
+        self._reveal_first_note()
+
+    def _reveal_first_note(self) -> None:
+        """Tras un análisis nuevo, si no hay nota seleccionada y la primera queda fuera de la vista, la muestra.
+
+        Si la pestaña está oculta se espera a que se muestre (``<Map>``): el
+        ancho visible aún no es el real.
+        """
+        if not self._show_first_note or not self._note_boxes or self.view_state != "tab":
+            return
+        if not self.canvas.winfo_ismapped():
+            return
+        self._show_first_note = False
+        if self.selected is not None:
+            return
+        first = min(self._note_boxes, key=lambda pos: self._note_boxes[pos][0])
+        self.scroll_to(first)  # solo se mueve si no está visible (a un tercio desde la izquierda)
 
     def _request_refresh(self) -> None:
         """Agrupa varios eventos seguidos (análisis + transcripciones) en un solo redibujo."""
@@ -1278,6 +1425,7 @@ class TablatureTab(ttk.Frame):
         zoom_ok = has_tab and not self.ascii_var.get()
         for widget in (self.zoom_scale, self.btn_zoom_in, self.btn_zoom_out, self.btn_fit):
             widget.state(["!disabled"] if zoom_ok else ["disabled"])
+        self._update_listen_controls(has_tab)
         if self._config_stale():
             self.banner.grid()
         else:
@@ -1396,6 +1544,7 @@ class TablatureTab(ttk.Frame):
             for k, gt_note in enumerate(self.ground_truth or []):
                 self._draw_gt_note(k, gt_note)
         self._draw_selection()
+        self._draw_play_marks()
         self._update_sticky()
         self._layout_info_row()
 
@@ -1728,8 +1877,19 @@ class TablatureTab(ttk.Frame):
             height = self._layout.height
             self.canvas.configure(scrollregion=(0, 0, max(self._content_width, self._visible_width()), height))
             self._update_sticky()
+            if self._show_first_note:
+                self.after_idle(self._reveal_first_note)
         else:
             self._redraw_canvas()
+
+    def _on_canvas_map(self, _event: tk.Event) -> None:
+        """El lienzo acaba de mostrarse: si hay pendiente «llevar a la primera nota», se hace ahora.
+
+        ``_on_map`` (de la pestaña) llega antes de que el lienzo esté mapeado y
+        :meth:`_reveal_first_note` no puede medir el ancho visible; aquí sí.
+        """
+        if self._show_first_note:
+            self.after_idle(self._reveal_first_note)
 
     def _on_tab_configure(self, _event: tk.Event) -> None:
         """Cambia a la geometría compacta en ventanas bajas (≈ 1024×700) y viceversa."""
@@ -1742,8 +1902,18 @@ class TablatureTab(ttk.Frame):
             self._apply_compact()
 
     def _apply_compact(self) -> None:
-        """Aplica la geometría (fuentes del lienzo y barra de la figura) y redibuja."""
+        """Aplica la geometría (fuentes del lienzo, barra de la figura, alto mínimo del panel) y redibuja."""
         g = self.geometry
+        # Alto mínimo PEDIDO por el panel inferior (luego crece con el espacio libre): en ventanas
+        # bajas la fila «Escuchar» ocupa dos líneas y la pestaña no debe pedir más alto que la ventana.
+        self.detail_body.configure(height=DETAIL_MIN_HEIGHT_COMPACT if self.compact else DETAIL_MIN_HEIGHT)
+        # Leyenda corta en ventanas bajas: cabe junto al resumen en una sola línea (el texto
+        # completo sigue en el tooltip de cada estado).
+        texts = OUTCOME_SHORT_TEXT if self.compact else OUTCOME_TEXT
+        for code, label in self._legend_labels.items():
+            label.configure(text=texts[code])
+        self._wrapped_info = None
+        self._layout_info_row()
         self.font_fret.configure(size=g.font_size)
         self.font_small.configure(size=g.small_font_size)
         self.font_badge.configure(size=g.small_font_size)
@@ -1759,7 +1929,9 @@ class TablatureTab(ttk.Frame):
 
     # ============================================================== selección
     def _canvas_key(self, x: int, y: int) -> Hashable | None:
-        """Nota (``("pos", n)``) o nota real (``("gt", k)``) bajo el punto ``(x, y)`` del lienzo."""
+        """Nota (``("pos", n)``), nota real (``("gt", k)``) o regla (``("ruler", 0)``) bajo ``(x, y)``."""
+        if self._over_ruler(y):
+            return ("ruler", 0)
         cx, cy = self.canvas.canvasx(x), self.canvas.canvasy(y)
         for item in reversed(self.canvas.find_overlapping(cx - 1, cy - 1, cx + 1, cy + 1)):
             for tag in self.canvas.gettags(item):
@@ -1842,6 +2014,9 @@ class TablatureTab(ttk.Frame):
         kind, index = key  # type: ignore[misc]
         if self.analysis is None:
             return ""
+        if kind == "ruler":
+            return ("Regla de tiempo (s). Clic: escuchar la tablatura desde ese instante (con el modo elegido en "
+                    "«Escuchar»).")
         if kind == "gt":
             gt = self.ground_truth or []
             if not 0 <= index < len(gt):
@@ -2032,15 +2207,8 @@ class TablatureTab(ttk.Frame):
 
     def _tree_key(self, x: int, y: int) -> Hashable | None:
         """Encabezado de columna bajo el puntero (para su tooltip)."""
-        if self.tree.identify_region(x, y) not in ("heading", "separator"):
-            return None
-        column = self.tree.identify_column(x)  # "#n": n-ésima columna VISIBLE (1 = la primera)
-        try:
-            index = int(column.lstrip("#")) - 1
-        except ValueError:
-            return None
-        shown = self._shown_arm_columns()
-        return ("heading", shown[index]) if 0 <= index < len(shown) else None
+        column = tree_heading_at(self.tree, x, y)
+        return ("heading", column) if column is not None else None
 
     def _shown_arm_columns(self) -> list[str]:
         """Identificadores de las columnas visibles de la tabla de brazos, en orden."""
@@ -2126,7 +2294,15 @@ class TablatureTab(ttk.Frame):
     # ================================================================ eventos
     def _on_analysis_ready(self, analysis: AnalysisResult | None = None, **_kwargs: Any) -> None:
         """Nuevo análisis: se olvida la selección y se redibuja (agrupado con las transcripciones)."""
-        self.analysis = analysis if analysis is not None else self.app.state.analysis
+        self.playback.stop()  # otro audio (o los mismos segmentos re-transcritos): se empieza de cero
+        new = analysis if analysis is not None else self.app.state.analysis
+        # Análisis nuevo (no una re-transcripción, que conserva la señal): la vista empieza en la
+        # primera nota. Con una canción que empieza tarde (Money: 12.6 s) se abría en un tramo
+        # vacío y parecía que la transcripción había fallado.
+        if new is not None and (self.analysis is None or new.y_raw is not self.analysis.y_raw):
+            self._show_first_note = True
+            self.canvas.xview_moveto(0.0)
+        self.analysis = new
         self.selected = self.app.state.selected_position
         self._recompute_comparison()
         self._request_refresh()
@@ -2187,6 +2363,8 @@ class TablatureTab(ttk.Frame):
             self._schedule_detail_plot()
         if self.view_state == "tab" and self.selected is not None:
             self.after_idle(lambda: self.selected is not None and self.scroll_to(self.selected))
+        elif self._show_first_note:
+            self.after_idle(self._reveal_first_note)
 
     def _on_compare_toggled(self) -> None:
         """Casilla «Comparar con ground truth»."""
@@ -2198,6 +2376,252 @@ class TablatureTab(ttk.Frame):
     def _on_retranscribe(self) -> None:
         """Botón del aviso: re-transcribir con la configuración actual (acción de la aplicación)."""
         self.app.retranscribe()
+
+    # ===================================================== escuchar la tablatura
+    def _run_synthesis(self, title: str, fn: Callable[..., Any], on_done: Callable[[Any], None]) -> bool:
+        """Lanza la síntesis como tarea de la aplicación (barra de progreso y «Cancelar»).
+
+        Si ya hay otra tarea en curso no se lanza (devuelve False y el
+        reproductor avisa en la barra de estado), en vez de abrir el diálogo
+        «Tarea en curso» de :meth:`gui.app.SmartunerApp.run_task`.
+        """
+        if self.app.busy:
+            return False
+        return bool(self.app.run_task(title, fn, on_done, error_title="No se pudo sintetizar la tablatura"))
+
+    def _sync_playback(self) -> None:
+        """Entrega al reproductor la tablatura mostrada y el audio original (o lo detiene si no hay).
+
+        :meth:`gui.playback.TabPlayback.set_source` no hace nada si las notas
+        audibles no cambiaron; si cambiaron mientras suena (otro algoritmo con
+        otras notas), sigue sonando desde el mismo instante con la síntesis nueva.
+        """
+        tr = self.transcription()
+        if tr is None or self.analysis is None or not tr.notes:
+            self.playback.stop()
+            self.playback.set_source([])
+            self._update_play_time(0.0)
+            return
+        self.playback.set_source(tr.notes, original=self.analysis.y_raw, sr=self.analysis.sr,
+                                 name=f"{self._export_stem()}_{self.algorithm}")
+        self._update_play_time(self.playback.position_s)
+
+    def play_from(self, start_s: float) -> None:
+        """Escucha la tablatura desde ``start_s`` segundos (también salta si ya sonaba).
+
+        Antes reclama la salida de audio: si la pestaña Audio estaba
+        reproduciendo, se detiene (:meth:`gui.app.SmartunerApp.claim_audio_output`).
+
+        Parameters
+        ----------
+        start_s : float
+            Instante (s) en el tiempo del audio original.
+        """
+        if self.transcription() is None:
+            self.app.status.set_message("No hay tablatura que escuchar: primero analiza un audio.")
+            return
+        if self.playback.state == "stopped" and self.app.busy:
+            self.app.status.set_message("Hay una tarea en curso: espera a que termine para escuchar la tablatura.")
+            return
+        self.app.claim_audio_output(SOURCE)
+        self.playback.play(max(0.0, float(start_s)))
+
+    def toggle_playback(self) -> None:
+        """▶ / ⏸ (y la barra espaciadora): reproducir, pausar o reanudar.
+
+        Parada, empieza :data:`PLAY_PREROLL_S` antes de la nota seleccionada (o
+        desde el principio si no hay ninguna).
+        """
+        state = self.playback.state
+        if state in ("playing", "preparing"):
+            self.playback.pause()
+            return
+        if state == "paused":
+            self.app.claim_audio_output(SOURCE)
+            self.playback.resume()
+            return
+        start = 0.0
+        notes = self.notes
+        if self.selected is not None and 0 <= self.selected < len(notes):
+            start = max(0.0, notes[self.selected].start_s - PLAY_PREROLL_S)
+        self.play_from(start)
+
+    def stop_playback(self) -> None:
+        """■: detiene la reproducción y vuelve al principio."""
+        self.playback.stop()
+
+    def _on_space(self, _event: tk.Event) -> str:
+        """Barra espaciadora sobre la tablatura: ▶ / ⏸."""
+        if self.transcription() is not None:
+            self.toggle_playback()
+        return "break"
+
+    def _over_ruler(self, y: int) -> bool:
+        """True si ``y`` (px del lienzo visible) cae en la regla de tiempo de una tablatura dibujada."""
+        return self.view_state == "tab" and 0 <= y < self.geometry.ruler_h
+
+    def _on_ruler_click(self, event: tk.Event) -> None:
+        """Clic en la regla de tiempo: escuchar desde ese instante."""
+        if not self._over_ruler(event.y) or self.transcription() is None:
+            return
+        self.play_from((self.canvas.canvasx(event.x) - X0) / self.zoom)
+
+    def _on_canvas_motion(self, event: tk.Event) -> None:
+        """Puntero «mano» sobre la regla (se puede hacer clic para escuchar desde ahí)."""
+        over = self._over_ruler(event.y) and self.transcription() is not None
+        if over != self._ruler_cursor:
+            self._ruler_cursor = over
+            self.canvas.configure(cursor="hand2" if over else "")
+
+    def _on_play_mode(self) -> None:
+        """Modo de escucha (MIDI / Original / Mezcla / A/B estéreo); si suena, continúa en el mismo instante."""
+        mode = self.play_mode_var.get()
+        if self.playback.state in ("playing", "preparing"):
+            self.app.claim_audio_output(SOURCE)
+        self.playback.mode = mode
+
+    def _on_synth_method(self) -> None:
+        """Sintetizador elegido en la lista (re-sintetiza si hace falta)."""
+        method = self._synth_by_label.get(self.synth_var.get(), "auto")
+        self.playback.method = method
+
+    def _update_listen_controls(self, has_tab: bool | None = None) -> None:
+        """Habilita los controles de «Escuchar» según haya tablatura, tarea en curso y estado del reproductor."""
+        if has_tab is None:
+            has_tab = self.transcription() is not None
+        state = self.playback.state
+        play_ok = has_tab and state != "preparing" and not (self._busy and state == "stopped")
+        self.btn_play.state(["!disabled"] if play_ok else ["disabled"])
+        self.btn_stop.state(["!disabled"] if has_tab and state != "stopped" else ["disabled"])
+        for radio in self.mode_radios.values():
+            radio.state(["!disabled"] if has_tab else ["disabled"])
+        self.synth_combo.state(["readonly", "!disabled"] if has_tab and not self._busy else ["disabled"])
+        texts = {"playing": "⏸ Pausa", "paused": "▶ Reanudar", "preparing": "Sintetizando…"}
+        self.btn_play.configure(text=texts.get(state, "▶ Reproducir"))
+
+    def _on_play_state(self, state: str) -> None:
+        """El reproductor cambió de estado: botones, cursor y resalte."""
+        if state == "stopped":
+            self._clear_play_marks()
+            self._update_play_time(0.0)
+        elif state == "preparing":
+            self._draw_play_marks()  # el cursor espera en el instante desde el que sonará
+            self._update_play_time(self.playback.position_s)
+        elif state == "paused":
+            self._update_play_time(self.playback.position_s)
+        self._update_listen_controls()
+
+    def _update_play_time(self, t: float) -> None:
+        """Texto «instante / duración» de la fila «Escuchar»."""
+        self.play_time_label.configure(text=f"{format_clock(t)} / {format_clock(self.playback.duration_s)}")
+
+    def _on_play_position(self, t: float) -> None:
+        """Aviso de posición (~33 por segundo): mueve el cursor, resalta la nota que suena y sigue la vista.
+
+        Es barato a propósito (se llama decenas de veces por segundo): mueve
+        dos elementos del lienzo con ``canvas.move`` y redibuja el contorno de
+        la nota solo cuando cambia. NO selecciona la nota (eso redibujaría el
+        espectro y avisaría a las demás pestañas en cada nota).
+        """
+        self._update_play_time(t)
+        if self.view_state != "tab":
+            return
+        x = self.x_of(t)
+        if self._play_x is None or not self.canvas.find_withtag("playcursor"):
+            self._draw_play_cursor(x)
+        elif x != self._play_x:
+            self.canvas.move("playcursor", x - self._play_x, 0)
+            self._play_x = x
+        self._mark_playing_note(self.playback.note_at(t))
+        if self.follow_var.get() and self.playback.state == "playing":
+            self._follow_cursor(x)
+
+    def _draw_play_marks(self) -> None:
+        """Dibuja el cursor y el contorno de la nota que suena (tras redibujar el lienzo), si hay reproducción."""
+        self._play_x = None
+        self._playing_pos = None
+        if self.view_state != "tab" or self.playback.state == "stopped":
+            return
+        t = self.playback.position_s
+        self._draw_play_cursor(self.x_of(t))
+        self._mark_playing_note(self.playback.note_at(t))
+
+    def _draw_play_cursor(self, x: float) -> None:
+        """Cursor de reproducción: línea vertical verde con un triángulo sobre la regla."""
+        canvas = self.canvas
+        canvas.delete("playcursor")
+        height = self._layout.height
+        # state="disabled": el cursor no captura clics (se puede pinchar la nota que tiene debajo).
+        canvas.create_line(x, 0, x, height, fill=PLAY_COLOR, width=2, tags=("playcursor",), state="disabled")
+        canvas.create_polygon(x - 6, 1, x + 6, 1, x, 10, fill=PLAY_COLOR, outline="", tags=("playcursor",),
+                              state="disabled")
+        canvas.tag_raise("playcursor")
+        self._play_x = x
+
+    def _mark_playing_note(self, position: int | None) -> None:
+        """Contorno verde alrededor de la nota que suena (solo se redibuja si cambió)."""
+        if position == self._playing_pos and (position is None or self.canvas.find_withtag("playing")):
+            return
+        self.canvas.delete("playing")
+        self._playing_pos = position
+        box = self._note_boxes.get(position) if position is not None else None
+        if box is None:
+            return
+        x0, y0, x1, y1 = box
+        _round_rect(self.canvas, x0 - 4, y0 - 4, x1 + 4, y1 + 4, radius=7, fill="", outline=PLAY_COLOR, width=3,
+                    tags=("playing",), state="disabled")
+        self.canvas.tag_raise("playcursor")
+
+    def _follow_cursor(self, x: float) -> None:
+        """«Seguir»: si el cursor sale de la zona visible (o pasa del 85 %), avanza una página."""
+        left, right = self.visible_range()
+        width = right - left
+        if left <= x <= left + FOLLOW_MARGIN * width:
+            return
+        total = max(self._content_width, self._visible_width())
+        if total <= width:
+            return
+        self.canvas.xview_moveto(max(0.0, x - FOLLOW_LEAD * width) / total)
+        self._update_sticky()
+
+    def _clear_play_marks(self) -> None:
+        """Borra el cursor y el contorno de la nota que suena (al detener o terminar)."""
+        self.canvas.delete("playcursor", "playing")
+        self._play_x = None
+        self._playing_pos = None
+
+    def _on_audio_output_claimed(self, owner: str = "", **_kwargs: Any) -> None:
+        """Otra pestaña va a reproducir (o la ventana se cierra): se pausa conservando la posición."""
+        if owner == SOURCE:
+            return
+        if owner == "quit":
+            self.playback.close()
+        elif self.playback.state in ("playing", "preparing"):
+            self.playback.pause()
+            self.app.status.set_message(f"Tablatura en pausa en {format_clock(self.playback.position_s)}: suena "
+                                        "el audio de otra pestaña. Pulsa ▶ Reanudar para continuar.")
+
+    def _on_destroy(self, event: tk.Event) -> None:
+        """Al destruir la pestaña se detiene la reproducción y se libera la caché de síntesis."""
+        if event.widget is self:
+            self.playback.close()
+
+    def _play_help(self) -> str:
+        """Tooltip de ▶ (con el aviso si no hay reproducción integrada)."""
+        text = ("Reproducir / pausar (espacio). Parado, empieza 1 s antes de la nota seleccionada, o desde el "
+                "principio si no hay ninguna. La primera vez se sintetiza la tablatura (unos segundos para una "
+                "canción entera); después queda en memoria.")
+        if not self.playback.available:
+            text += (f"\n\n{self.playback.unavailable_reason} Al pulsar ▶ se abrirá un WAV con el reproductor del "
+                     "sistema (sin cursor sincronizado).")
+        return text
+
+    def _synth_help(self) -> str:
+        """Tooltip de «Síntesis»: qué sintetizador se usará de verdad."""
+        resolved = SYNTH_LABELS.get(self.playback.resolved_method, self.playback.resolved_method)
+        return ("Cómo se convierten las notas MIDI en audio. FluidSynth usa un soundfont de bajo eléctrico (más "
+                "realista; requiere fluidsynth y un soundfont instalados); Karplus-Strong es una cuerda pulsada "
+                f"sintética, siempre disponible. «Automática» elige FluidSynth si está. Ahora se usa: {resolved}.")
 
     # ============================================================= exportación
     def _export_stem(self) -> str:
